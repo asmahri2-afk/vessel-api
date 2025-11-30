@@ -1,20 +1,8 @@
 import json
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],        # allow your HTML file anywhere
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 HEADERS = {
     "User-Agent": (
@@ -26,10 +14,31 @@ HEADERS = {
     "Referer": "https://www.vesselfinder.com/",
 }
 
+app = FastAPI()
+
+# --- CORS via official middleware ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # or ["https://your-site"] if you want to restrict
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- Extra safety CORS layer (for some hosts/proxies) ---
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
+
 
 def scrape_vf_full(imo: str) -> dict:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
     r = requests.get(url, headers=HEADERS, timeout=20)
+
     if r.status_code == 404:
         return {"found": False, "imo": imo}
     r.raise_for_status()
@@ -44,7 +53,7 @@ def scrape_vf_full(imo: str) -> dict:
     dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
     destination = dest_el.get_text(strip=True) if dest_el else ""
 
-    # AIS time (from info icon)
+    # AIS time (from info icon tooltip)
     info_icon = soup.select_one("svg.ttt1.info")
     last_pos_utc = (
         info_icon["data-title"]
@@ -55,7 +64,7 @@ def scrape_vf_full(imo: str) -> dict:
     # AIS numeric data from #djson[data-json]
     djson_div = soup.find("div", id="djson")
     if not djson_div or not djson_div.has_attr("data-json"):
-        # no live position → mark as not found
+        # no live position → still return basic info
         return {
             "found": True,
             "imo": imo,
@@ -83,8 +92,8 @@ def scrape_vf_full(imo: str) -> dict:
         "lon": lon,
         "sog": sog,
         "cog": cog,
-        "last_pos_utc": last_pos_utc,   # e.g. "Nov 30, 2025 17:07 UTC"
-        "destination": destination,     # e.g. "Tan Tan, Morocco"
+        "last_pos_utc": last_pos_utc,
+        "destination": destination,
     }
 
 

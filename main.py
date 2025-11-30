@@ -1,11 +1,9 @@
-# app/main.py (or wherever your routes are)
+import json
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
-
-VF_BASE = "https://www.vesselfinder.com/vessels/details"
 
 HEADERS = {
     "User-Agent": (
@@ -18,47 +16,36 @@ HEADERS = {
 }
 
 def scrape_vf_full(imo: str) -> dict:
-    url = f"{VF_BASE}/{imo}"
+    url = f"https://www.vesselfinder.com/vessels/details/{imo}"
     r = requests.get(url, headers=HEADERS, timeout=20)
     if r.status_code == 404:
         return {"found": False, "imo": imo}
-
-    if not r.ok:
-        raise HTTPException(status_code=502, detail=f"Vesselfinder HTTP {r.status_code}")
+    r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # name
-    title = soup.find("h1")
-    name = title.text.strip() if title else f"IMO {imo}"
+    # Name
+    name_el = soup.select_one("h1.title")
+    name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
-    # ---- THIS PART MUST MATCH THE REAL PAGE ----
-    # Example if you already extracted JSON earlier:
-    # look for application/ld+json, or for a script containing AIS data
-    json_ld = soup.find("script", {"type": "application/ld+json"})
-    if not json_ld:
-        return {
-            "found": True,
-            "imo": imo,
-            "name": name,
-            "lat": None,
-            "lon": None,
-            "sog": None,
-            "cog": None,
-            "last_pos_utc": None,
-            "destination": "",
-        }
+    # Destination (voyage data box)
+    dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
+    destination = dest_el.get_text(strip=True) if dest_el else ""
 
-    data = json.loads(json_ld.text)
-    if isinstance(data, list) and data:
-        data = data[0]
+    # AIS timestamp (info icon)
+    info_icon = soup.select_one("svg.ttt1.info")
+    last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
 
-    lat = float(data.get("latitude")) if data.get("latitude") is not None else None
-    lon = float(data.get("longitude")) if data.get("longitude") is not None else None
-    sog = float(data.get("speed")) if data.get("speed") is not None else None
-    cog = float(data.get("course")) if data.get("course") is not None else None
-    last_pos_utc = data.get("dateModified")
-    destination = data.get("arrivalDestination", "") or ""
+    # AIS numeric data from #djson
+    djson_div = soup.find("div", id="djson")
+    ais = {}
+    if djson_div and djson_div.has_attr("data-json"):
+        ais = json.loads(djson_div["data-json"])
+
+    lat = ais.get("ship_lat")
+    lon = ais.get("ship_lon")
+    sog = ais.get("ship_sog")
+    cog = ais.get("ship_cog")
 
     return {
         "found": True,
@@ -68,8 +55,8 @@ def scrape_vf_full(imo: str) -> dict:
         "lon": lon,
         "sog": sog,
         "cog": cog,
-        "last_pos_utc": last_pos_utc,
-        "destination": destination,
+        "last_pos_utc": last_pos_utc,   # "Nov 30, 2025 17:07 UTC"
+        "destination": destination,     # "Tan Tan, Morocco"
     }
 
 @app.get("/vessel-full/{imo}")

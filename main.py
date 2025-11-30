@@ -5,21 +5,22 @@ from bs4 import BeautifulSoup
 
 app = FastAPI()
 
-# --- CORS so your local HTML / GitHub Pages can call this ---
+# Allow your HTML frontend to access the API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can restrict to your domain
+    allow_origins=["*"],   # allow all, you can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-VF_BASE = "https://www.vesselfinder.com/vessels/details/"
+@app.get("/")
+def root():
+    return {"status": "ok", "message": "Vessel API is running"}
 
 
-def fetch_vessel_name(imo: str) -> str | None:
-    """Scrape VesselFinder page and return vessel name, or None if not found."""
-    url = f"{VF_BASE}{imo}"
+def fetch_vessel_name(imo: str):
+    url = f"https://www.vesselfinder.com/vessels/details/{imo}"
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -28,31 +29,23 @@ def fetch_vessel_name(imo: str) -> str | None:
         )
     }
 
-    resp = requests.get(url, headers=headers, timeout=15)
+    resp = requests.get(url, headers=headers, timeout=10)
 
-    # 404 or similar
     if resp.status_code != 200:
         return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
 
-    # On your sample page:  <h1 class="title">DURA BULK</h1>
-    h1 = soup.select_one("h1.title") or soup.find("h1")
+    # VesselFinder title is <h1 class="title">NAME</h1>
+    h1 = soup.select_one("h1.title")
     if not h1:
         return None
 
-    name = h1.get_text(strip=True)
-    return name or None
+    return h1.get_text(strip=True)
 
 
 @app.get("/vessel/{imo}")
-def get_vessel(imo: str):
-    """
-    Simple API: returns vessel name for an IMO, based on VesselFinder.
-    Example response:
-      { "found": true, "imo": "7325461", "name": "DURA BULK" }
-    """
-    # Basic sanity check
+def vessel_lookup(imo: str):
     if not imo.isdigit():
         raise HTTPException(status_code=400, detail="IMO must be numeric")
 

@@ -15,6 +15,7 @@ HEADERS = {
     "Referer": "https://www.vesselfinder.com/",
 }
 
+
 def scrape_vf_full(imo: str) -> dict:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -24,23 +25,39 @@ def scrape_vf_full(imo: str) -> dict:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Name
+    # Vessel name
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
-    # Destination (voyage data box)
+    # Destination text
     dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
     destination = dest_el.get_text(strip=True) if dest_el else ""
 
-    # AIS timestamp (info icon)
+    # AIS time (from info icon)
     info_icon = soup.select_one("svg.ttt1.info")
-    last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
+    last_pos_utc = (
+        info_icon["data-title"]
+        if info_icon is not None and info_icon.has_attr("data-title")
+        else None
+    )
 
-    # AIS numeric data from #djson
+    # AIS numeric data from #djson[data-json]
     djson_div = soup.find("div", id="djson")
-    ais = {}
-    if djson_div and djson_div.has_attr("data-json"):
-        ais = json.loads(djson_div["data-json"])
+    if not djson_div or not djson_div.has_attr("data-json"):
+        # no live position → mark as not found
+        return {
+            "found": True,
+            "imo": imo,
+            "name": name,
+            "lat": None,
+            "lon": None,
+            "sog": None,
+            "cog": None,
+            "last_pos_utc": last_pos_utc,
+            "destination": destination,
+        }
+
+    ais = json.loads(djson_div["data-json"])
 
     lat = ais.get("ship_lat")
     lon = ais.get("ship_lon")
@@ -55,9 +72,10 @@ def scrape_vf_full(imo: str) -> dict:
         "lon": lon,
         "sog": sog,
         "cog": cog,
-        "last_pos_utc": last_pos_utc,   # "Nov 30, 2025 17:07 UTC"
-        "destination": destination,     # "Tan Tan, Morocco"
+        "last_pos_utc": last_pos_utc,   # e.g. "Nov 30, 2025 17:07 UTC"
+        "destination": destination,     # e.g. "Tan Tan, Morocco"
     }
+
 
 @app.get("/vessel-full/{imo}")
 def vessel_full(imo: str):

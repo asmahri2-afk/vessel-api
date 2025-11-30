@@ -1,56 +1,80 @@
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
+# app/main.py (or wherever your routes are)
 import requests
 from bs4 import BeautifulSoup
+from fastapi import FastAPI, HTTPException
 
 app = FastAPI()
 
-# Allow your HTML frontend to access the API
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],   # allow all, you can restrict later
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+VF_BASE = "https://www.vesselfinder.com/vessels/details"
 
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Vessel API is running"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.vesselfinder.com/",
+}
 
+def scrape_vf_full(imo: str) -> dict:
+    url = f"{VF_BASE}/{imo}"
+    r = requests.get(url, headers=HEADERS, timeout=20)
+    if r.status_code == 404:
+        return {"found": False, "imo": imo}
 
-def fetch_vessel_name(imo: str):
-    url = f"https://www.vesselfinder.com/vessels/details/{imo}"
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
+    if not r.ok:
+        raise HTTPException(status_code=502, detail=f"Vesselfinder HTTP {r.status_code}")
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    # name
+    title = soup.find("h1")
+    name = title.text.strip() if title else f"IMO {imo}"
+
+    # ---- THIS PART MUST MATCH THE REAL PAGE ----
+    # Example if you already extracted JSON earlier:
+    # look for application/ld+json, or for a script containing AIS data
+    json_ld = soup.find("script", {"type": "application/ld+json"})
+    if not json_ld:
+        return {
+            "found": True,
+            "imo": imo,
+            "name": name,
+            "lat": None,
+            "lon": None,
+            "sog": None,
+            "cog": None,
+            "last_pos_utc": None,
+            "destination": "",
+        }
+
+    data = json.loads(json_ld.text)
+    if isinstance(data, list) and data:
+        data = data[0]
+
+    lat = float(data.get("latitude")) if data.get("latitude") is not None else None
+    lon = float(data.get("longitude")) if data.get("longitude") is not None else None
+    sog = float(data.get("speed")) if data.get("speed") is not None else None
+    cog = float(data.get("course")) if data.get("course") is not None else None
+    last_pos_utc = data.get("dateModified")
+    destination = data.get("arrivalDestination", "") or ""
+
+    return {
+        "found": True,
+        "imo": imo,
+        "name": name,
+        "lat": lat,
+        "lon": lon,
+        "sog": sog,
+        "cog": cog,
+        "last_pos_utc": last_pos_utc,
+        "destination": destination,
     }
 
-    resp = requests.get(url, headers=headers, timeout=10)
-
-    if resp.status_code != 200:
-        return None
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # VesselFinder title is <h1 class="title">NAME</h1>
-    h1 = soup.select_one("h1.title")
-    if not h1:
-        return None
-
-    return h1.get_text(strip=True)
-
-
-@app.get("/vessel/{imo}")
-def vessel_lookup(imo: str):
-    if not imo.isdigit():
-        raise HTTPException(status_code=400, detail="IMO must be numeric")
-
-    name = fetch_vessel_name(imo)
-    if not name:
-        return {"found": False, "imo": imo, "name": None}
-
-    return {"found": True, "imo": imo, "name": name}
+@app.get("/vessel-full/{imo}")
+def vessel_full(imo: str):
+    data = scrape_vf_full(imo)
+    if not data.get("found"):
+        raise HTTPException(status_code=404, detail="Vessel not found")
+    return data

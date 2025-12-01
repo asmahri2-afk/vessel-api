@@ -16,6 +16,11 @@ HEADERS = {
 
 app = FastAPI()
 
+# 🔹 WARM-UP ENDPOINT
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
 # --- CORS via official middleware ---
 app.add_middleware(
     CORSMiddleware,

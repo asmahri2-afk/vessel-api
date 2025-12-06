@@ -41,27 +41,27 @@ async def add_cors_headers(request: Request, call_next):
     return response
 
 
-# 💡 HELPER FUNCTION TO SCRAPE TABLES
+# 💡 HELPER FUNCTION TO SCRAPE TABLES (No change needed here)
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
     """Extracts key-value pairs from specific tables based on CSS classes."""
     data = {}
     
-    # Target tables based on the VesselFinder HTML structure
     tables = soup.find_all(class_=table_class)
     if not tables:
         return data
 
     for table in tables:
-        # Loop through all rows in the table
         for row in table.find_all('tr'):
-            # Look for cells containing the label (class tpc1 or tpx1) and the value (tpc2 or tpx2)
             label_el = row.find(class_=lambda x: x and ('tpc1' in x or 'tpx1' in x))
             value_el = row.find(class_=lambda x: x and ('tpc2' in x or 'tpx2' in x))
 
             if label_el and value_el:
-                label = label_el.get_text(strip=True).replace(':', '').strip()
+                # Get the label text and remove the <small> tag content (like '(m)' or '(t)')
+                # Use .contents to get all elements/strings inside tpc1/tpx1
+                label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
+                label = ' '.join(label_parts).replace(':', '').strip()
+                
                 value = value_el.get_text(strip=True)
-                # Store the data using the clean label as the key
                 data[label] = value
                 
     return data
@@ -76,9 +76,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # ------------------------------------------------------------------
     # 1. CORE INFO (Name, IMO, Destination)
-    # ------------------------------------------------------------------
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
@@ -92,79 +90,51 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         else None
     )
 
-    # Extract flag from the header flag icon title
     flag_el = soup.select_one("div.title-flag-icon")
     flag = flag_el.get("title") if flag_el else None
     
-    # Extract vessel type from the subtitle
     vessel_type_el = soup.select_one("h2.vst")
     vessel_type = vessel_type_el.get_text(strip=True).split(',')[0].strip() if vessel_type_el else None
 
 
-    # ------------------------------------------------------------------
     # 2. STATIC SPECIFICATIONS (USING HELPER FUNCTION)
-    # ------------------------------------------------------------------
-    # Combine data from the two primary technical specification tables
     tech_data = extract_table_data(soup, 'tpt1')
     dims_data = extract_table_data(soup, 'tptfix')
     static_data = {**tech_data, **dims_data} # Merge both dictionaries
 
-    # Map and clean the extracted values, using default values if not found
+    # Map and clean the extracted values
+    # NOTE: The helper now processes the label to remove the <small> tag contents.
+    # E.g., "Deadweight (t)" becomes "Deadweight".
     final_static_data = {
-        # Fields requested by the user
         "imo": imo,
         "vessel_name": name,
         "ship_type": vessel_type,
         "flag": flag,
         
-        # Static numeric/string fields from tables
-        "deadweight_t": static_data.get("DWT"),
+        # 🟢 FIX for Deadweight: Check for two possible clean keys
+        "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"), 
+        
         "gross_tonnage": static_data.get("Gross Tonnage"),
         "year_of_build": static_data.get("Year of Build"),
         
-        # Dimensions require parsing of Length x Breadth string
-        "dimensions": static_data.get("Length Overall x Breadth Extreme"),
+        # 🟢 NEW FIX for Dimensions: Direct lookup from the table using clean keys
+        "length_overall_m": static_data.get("Length Overall"),
+        "beam_m": static_data.get("Beam"),
     }
     
-    # Extract Length and Beam (Breadth) from the combined dimension string
-    dim_str = final_static_data.pop("dimensions", None)
-    length_m = None
-    beam_m = None
-    
-    if dim_str and 'x' in dim_str:
-        try:
-            # Format: '182.88 m x 32.2 m'
-            parts = dim_str.split('x')
-            length_m = parts[0].split()[0].strip()
-            beam_m = parts[1].split()[0].strip()
-        except:
-            # Handle unexpected format gracefully
-            pass
-
-    final_static_data["length_overall_m"] = length_m
-    final_static_data["beam_m"] = beam_m
-    
-    # ------------------------------------------------------------------
-    # 3. LIVE AIS DATA (EXISTING LOGIC)
-    # ------------------------------------------------------------------
-    
-    # Merge initial and static data
+    # 3. LIVE AIS DATA
     base_data = {
         "found": True,
         "destination": destination,
         "last_pos_utc": last_pos_utc,
-        **final_static_data # Merge the new data fields
+        **final_static_data
     }
 
     djson_div = soup.find("div", id="djson")
     if not djson_div or not djson_div.has_attr("data-json"):
-        # No live position: return basic and static info
-        base_data.update({
-             "lat": None, "lon": None, "sog": None, "cog": None, 
-        })
+        base_data.update({"lat": None, "lon": None, "sog": None, "cog": None})
         return base_data
 
-    # Live position found: parse and merge AIS data
     ais = json.loads(djson_div["data-json"])
     base_data.update({
         "lat": ais.get("ship_lat"),

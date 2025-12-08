@@ -20,6 +20,8 @@ HEADERS = {
     "Referer": "https://www.vesselfinder.com/",
 }
 
+MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
+
 # ============================================================
 # FASTAPI APP + CORS
 # ============================================================
@@ -80,6 +82,7 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
 
 def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[str]:
+    # Inline JS: var MMSI=538005492;
     for s in soup.find_all("script"):
         if not s.string:
             continue
@@ -101,7 +104,129 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MAIN SCRAPER – VESSELFINDER ONLY
+# MYSHIPTRACKING HELPER
+# ============================================================
+
+def get_myshiptracking_pos(
+    mmsi: str,
+    center_lat: Optional[float],
+    center_lon: Optional[float],
+    pad: float = 0.7,
+) -> Optional[Dict[str, Any]]:
+    """
+    Utilise l'endpoint MyShipTracking 'vesselsonmaptempTTT.php'
+    dans une petite bbox autour de la position VF, et retourne
+    les infos AIS pour le MMSI donné si trouvé.
+    """
+    if center_lat is None or center_lon is None:
+        return None
+
+    try:
+        lat_f = float(center_lat)
+        lon_f = float(center_lon)
+    except (TypeError, ValueError):
+        return None
+
+    minlat = lat_f - pad
+    maxlat = lat_f + pad
+    minlon = lon_f - pad
+    maxlon = lon_f + pad
+
+    filters_str = json.dumps({
+        "vtypes": ",0,3,4,6,7,8,9,10,11,12,13",
+        "ports": "1",
+        "minsog": 0,
+        "maxsog": 60,
+        "minsz": 0,
+        "maxsz": 500,
+        "minyr": 1950,
+        "maxyr": 2025,
+        "status": "",
+        "mapflt_from": "",
+        "mapflt_dest": "",
+    })
+
+    params = {
+        "type": "json",
+        "minlat": minlat,
+        "maxlat": maxlat,
+        "minlon": minlon,
+        "maxlon": maxlon,
+        "zoom": 12,      # comme dans ton payload console
+        "selid": -1,
+        "seltype": 0,
+        "timecode": -1,
+        "filters": filters_str,
+    }
+
+    mst_headers = dict(HEADERS)
+    mst_headers["Referer"] = "https://www.myshiptracking.com/"
+
+    try:
+        r = requests.get(
+            MYSHIPTRACKING_URL,
+            params=params,
+            headers=mst_headers,
+            timeout=10,
+        )
+    except requests.RequestException:
+        return None
+
+    if r.status_code != 200:
+        return None
+
+    try:
+        data = r.json()
+    except ValueError:
+        return None
+
+    if not isinstance(data, list):
+        return None
+
+    candidate = None
+    for ship in data:
+        ship_mmsi = str(
+            ship.get("mmsi")
+            or ship.get("MMSI")
+            or ""
+        ).strip()
+        if ship_mmsi == str(mmsi):
+            candidate = ship
+            break
+
+    if not candidate:
+        return None
+
+    try:
+        lat = float(candidate.get("lat") or candidate.get("LAT"))
+        lon = float(candidate.get("lon") or candidate.get("LON"))
+    except (TypeError, ValueError):
+        return None
+
+    sog = candidate.get("speed") or candidate.get("SPEED") or candidate.get("sog")
+    cog = candidate.get("course") or candidate.get("COURSE") or candidate.get("cog")
+
+    try:
+        sog_f = float(sog) if sog is not None else None
+    except (TypeError, ValueError):
+        sog_f = None
+
+    try:
+        cog_f = float(cog) if cog is not None else None
+    except (TypeError, ValueError):
+        cog_f = None
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "sog": sog_f,
+        "cog": cog_f,
+        "timestamp": candidate.get("lastpos") or candidate.get("LASTPOS"),
+        "mst_raw": candidate,
+    }
+
+# ============================================================
+# MAIN SCRAPER – VESSELFINDER + MYSHIPTRACKING OVERRIDE
 # ============================================================
 
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
@@ -155,19 +280,43 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "beam_m": static_data.get("Beam"),
     }
 
-    # AIS
-    lat = lon = sog = cog = None
+    # AIS VESSELFINDER
+    vf_lat = vf_lon = None
+    sog = cog = None
     djson_div = soup.find("div", id="djson")
 
     if djson_div and djson_div.has_attr("data-json"):
         try:
             ais = json.loads(djson_div["data-json"])
-            lat = ais.get("ship_lat")
-            lon = ais.get("ship_lon")
+            ship_lat = ais.get("ship_lat")
+            ship_lon = ais.get("ship_lon")
             sog = ais.get("ship_sog")
             cog = ais.get("ship_cog")
-        except:
+            try:
+                vf_lat = float(ship_lat) if ship_lat is not None else None
+                vf_lon = float(ship_lon) if ship_lon is not None else None
+            except (TypeError, ValueError):
+                vf_lat = vf_lon = None
+        except Exception:
             pass
+
+    # OVERRIDE AVEC MYSHIPTRACKING SI POSSIBLE
+    mst_data: Optional[Dict[str, Any]] = None
+    if mmsi and vf_lat is not None and vf_lon is not None:
+        mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)
+
+    if mst_data:
+        lat = mst_data["lat"]
+        lon = mst_data["lon"]
+        if mst_data.get("sog") is not None:
+            sog = mst_data["sog"]
+        if mst_data.get("cog") is not None:
+            cog = mst_data["cog"]
+        ais_source = "myshiptracking"
+    else:
+        lat = vf_lat
+        lon = vf_lon
+        ais_source = "vesselfinder"
 
     result: Dict[str, Any] = {
         "found": True,
@@ -178,7 +327,11 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "lon": lon,
         "sog": sog,
         "cog": cog,
+        "ais_source": ais_source,
     }
+
+    if mst_data:
+        result["mst_timestamp"] = mst_data.get("timestamp")
 
     return result
 

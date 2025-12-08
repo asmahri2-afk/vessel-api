@@ -17,8 +17,11 @@ HEADERS = {
         "Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    # Referer mainly for VF; ShipFinder call will reuse headers
     "Referer": "https://www.vesselfinder.com/",
 }
+
+SHIPFINDER_URL = "https://shipfinder.co/endpoints/shipDeltaUpdate.php"
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -56,7 +59,7 @@ async def add_cors_headers(request: Request, call_next):
 
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
     """
-    Extracts key-value pairs from specific tables based on CSS classes.
+    Extract key-value pairs from specific tables based on CSS classes.
     Looks for rows with label in tpc1/tpx1 and value in tpc2/tpx2.
     """
     data: Dict[str, str] = {}
@@ -66,13 +69,19 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
     for table in tables:
         for row in table.find_all("tr"):
-            label_el = row.find(class_=lambda x: x and ("tpc1" in x or "tpx1" in x))
-            value_el = row.find(class_=lambda x: x and ("tpc2" in x or "tpx2" in x))
+            label_el = row.find(
+                class_=lambda x: x and ("tpc1" in x or "tpx1" in x)
+            )
+            value_el = row.find(
+                class_=lambda x: x and ("tpc2" in x or "tpx2" in x)
+            )
             if not (label_el and value_el):
                 continue
 
             # Remove small-tag content like "(m)", "(t)" etc.
-            label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
+            label_parts = [
+                c.strip() for c in label_el.contents if isinstance(c, str)
+            ]
             label = " ".join(label_parts).replace(":", "").strip()
             value = value_el.get_text(strip=True)
 
@@ -127,21 +136,50 @@ def make_bounds(lat: float, lon: float, pad: float = 0.7) -> str:
     return f"{south},{west},{north},{east}"
 
 
-def get_shipfinder_pos(mmsi: str, center_lat: Optional[float], center_lon: Optional[float]) -> Optional[Dict[str, Any]]:
+def get_shipfinder_pos(
+    mmsi: str,
+    center_lat: Optional[float],
+    center_lon: Optional[float],
+) -> Optional[Dict[str, Any]]:
     """
     Query ShipFinder shipDeltaUpdate endpoint around VF position to get live AIS.
     Returns dict with lat/lon/sog/cog/... or None if not found.
+
+    Expected format (simplified):
+
+      {
+        "352004273": [
+          "27.3859", "-14.0309", "11.9", "212.8", "70", "0", "1765229772"
+        ],
+        "352004278": [ ... ],
+        ...
+      }
+
+    Some variants might wrap this into a "ships" key; we handle both.
     """
     if center_lat is None or center_lon is None:
         return None
 
-    bounds = make_bounds(center_lat, center_lon)
+    try:
+        lat_f = float(center_lat)
+        lon_f = float(center_lon)
+    except (TypeError, ValueError):
+        return None
 
-    url = "https://shipfinder.co/endpoints/shipDeltaUpdate.php"
+    bounds = make_bounds(lat_f, lon_f)
     params = {"bounds": bounds}
 
+    # Reuse HEADERS but a ShipFinder-friendly Referer
+    sf_headers = dict(HEADERS)
+    sf_headers["Referer"] = "https://shipfinder.co/"
+
     try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r = requests.get(
+            SHIPFINDER_URL,
+            params=params,
+            headers=sf_headers,
+            timeout=10,
+        )
     except requests.RequestException:
         return None
 
@@ -153,7 +191,15 @@ def get_shipfinder_pos(mmsi: str, center_lat: Optional[float], center_lon: Optio
     except ValueError:
         return None
 
-    ships = data.get("ships", {})
+    # Some responses may be { "ships": { ... }, "representativeTimestamp": ... }
+    # Others may be { "35200...": [ ... ], ... } directly.
+    if isinstance(data, dict) and "ships" in data and isinstance(data["ships"], dict):
+        ships = data["ships"]
+        rep_ts = data.get("representativeTimestamp")
+    else:
+        ships = data if isinstance(data, dict) else {}
+        rep_ts = data.get("representativeTimestamp") if isinstance(data, dict) else None
+
     rec = ships.get(str(mmsi))
     if not rec or len(rec) < 7:
         return None
@@ -168,7 +214,7 @@ def get_shipfinder_pos(mmsi: str, center_lat: Optional[float], center_lon: Optio
             "heading": float(heading_str),
             "nav_status": int(status_str),
             "timestamp": int(ts_str),
-            "representativeTimestamp": data.get("representativeTimestamp"),
+            "representativeTimestamp": rep_ts,
         }
     except (ValueError, TypeError):
         return None
@@ -239,11 +285,14 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     if djson_div and djson_div.has_attr("data-json"):
         try:
             ais = json.loads(djson_div["data-json"])
-            vf_lat = ais.get("ship_lat")
-            vf_lon = ais.get("ship_lon")
+            # Ensure floats (needed for bounds math)
+            ship_lat = ais.get("ship_lat")
+            ship_lon = ais.get("ship_lon")
+            vf_lat = float(ship_lat) if ship_lat is not None else None
+            vf_lon = float(ship_lon) if ship_lon is not None else None
             vf_sog = ais.get("ship_sog")
             vf_cog = ais.get("ship_cog")
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
 
     # 4. OPTIONAL OVERRIDE FROM SHIPFINDER (LIVE AIS, USING VF POSITION AS CENTER)
@@ -251,7 +300,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     if mmsi:
         sf_data = get_shipfinder_pos(mmsi, vf_lat, vf_lon)
 
-    # Decide final AIS values
+    # Decide final AIS values: ShipFinder preferred if available
     lat = sf_data["lat"] if sf_data and sf_data.get("lat") is not None else vf_lat
     lon = sf_data["lon"] if sf_data and sf_data.get("lon") is not None else vf_lon
     sog = sf_data["sog"] if sf_data and sf_data.get("sog") is not None else vf_sog

@@ -111,7 +111,7 @@ def get_myshiptracking_pos(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
-    pad: float = 0.7,
+    pad: float = 1.5,
 ) -> Optional[Dict[str, Any]]:
     """
     Utilise l'endpoint MyShipTracking 'vesselsonmaptempTTT.php'

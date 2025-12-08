@@ -115,7 +115,7 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
 # SHIPFINDER HELPERS (USING MMSI + VF POSITION)
 # ============================================================
 
-def make_bounds(lat: float, lon: float, pad: float = 0.25) -> str:
+def make_bounds(lat: float, lon: float, pad: float = 0.7) -> str:
     """
     Build ShipFinder bounds string around a center (lat, lon).
     bounds = south,west,north,east

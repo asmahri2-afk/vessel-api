@@ -3,7 +3,7 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 HEADERS = {
     "User-Agent": (
@@ -17,12 +17,16 @@ HEADERS = {
 
 app = FastAPI()
 
-# 🔹 WARM-UP ENDPOINT
+# ─────────────────────────────────────
+# WARM-UP ENDPOINT
+# ─────────────────────────────────────
 @app.get("/ping")
 def ping():
     return {"ok": True}
 
-# --- CORS via official middleware ---
+# ─────────────────────────────────────
+# CORS
+# ─────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,7 +35,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Extra safety CORS layer (for some hosts/proxies) ---
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
@@ -41,12 +44,11 @@ async def add_cors_headers(request: Request, call_next):
     return response
 
 
-# 💡 HELPER FUNCTION TO SCRAPE TABLES
+# ─────────────────────────────────────
+# TABLE EXTRACTION FUNCTION
+# ─────────────────────────────────────
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
-    """
-    Extracts key-value pairs from specific tables based on CSS classes.
-    Looks for rows with label in tpc1/tpx1 and value in tpc2/tpx2.
-    """
+    """Extract key–value pairs from Vesselfinder info tables."""
     data: Dict[str, str] = {}
 
     tables = soup.find_all(class_=table_class)
@@ -59,17 +61,44 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
             value_el = row.find(class_=lambda x: x and ("tpc2" in x or "tpx2" in x))
 
             if label_el and value_el:
-                # Remove small tags content like "(m)", "(t)", etc.
                 label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
                 label = " ".join(label_parts).replace(":", "").strip()
-
                 value = value_el.get_text(strip=True)
+
                 if label:
                     data[label] = value
 
     return data
 
 
+# ─────────────────────────────────────
+# MMSI EXTRACTION (ROBUST)
+# ─────────────────────────────────────
+def extract_mmsi(static_data: Dict[str, str]) -> Optional[str]:
+    """
+    MMSI label on VF can be:
+      - "MMSI"
+      - "MMSI / Call Sign"
+      - "MMSI/Callsign"
+    This function returns MMSI regardless of naming.
+    """
+    # direct key
+    if "MMSI" in static_data:
+        v = static_data["MMSI"].strip()
+        return v or None
+
+    # search in keys
+    for key, value in static_data.items():
+        if "MMSI" in key.upper():
+            v = value.strip()
+            return v or None
+
+    return None
+
+
+# ─────────────────────────────────────
+# SCRAPER FUNCTION
+# ─────────────────────────────────────
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
     r = requests.get(url, headers=HEADERS, timeout=20)
@@ -80,7 +109,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 1. CORE INFO (Name, Destination, Last position, Flag, Type)
+    # 1 — CORE FIELDS
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
@@ -89,8 +118,8 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     info_icon = soup.select_one("svg.ttt1.info")
     last_pos_utc = (
-        info_icon["data-title"]
-        if info_icon is not None and info_icon.has_attr("data-title")
+        info_icon.get("data-title")
+        if info_icon and info_icon.has_attr("data-title")
         else None
     )
 
@@ -100,67 +129,60 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     vessel_type_el = soup.select_one("h2.vst")
     vessel_type = (
         vessel_type_el.get_text(strip=True).split(",")[0].strip()
-        if vessel_type_el
-        else None
+        if vessel_type_el else None
     )
 
-    # 2. STATIC SPECIFICATIONS (tables)
+    # 2 — STATIC DATA TABLES
     tech_data = extract_table_data(soup, "tpt1")
     dims_data = extract_table_data(soup, "tptfix")
     static_data = {**tech_data, **dims_data}
 
-    # 2.b Map and clean values
-    final_static_data: Dict[str, Any] = {
+    mmsi = extract_mmsi(static_data)
+
+    static_parsed = {
         "imo": imo,
         "vessel_name": name,
         "ship_type": vessel_type,
         "flag": flag,
-
-        # ✅ MMSI added
-        "mmsi": static_data.get("MMSI"),
-
-        # Deadweight may appear as "Deadweight" or "DWT"
+        "mmsi": mmsi,
         "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
         "gross_tonnage": static_data.get("Gross Tonnage"),
         "year_of_build": static_data.get("Year of Build"),
-
-        # Dimensions from cleaned labels
         "length_overall_m": static_data.get("Length Overall"),
         "beam_m": static_data.get("Beam"),
     }
 
-    # 3. BASE DATA
-    base_data: Dict[str, Any] = {
+    # 3 — AIS DATA FROM VF JSON
+    djson_div = soup.find("div", id="djson")
+    vf_lat = vf_lon = vf_sog = vf_cog = None
+
+    if djson_div and djson_div.has_attr("data-json"):
+        try:
+            ais = json.loads(djson_div["data-json"])
+            vf_lat = ais.get("ship_lat")
+            vf_lon = ais.get("ship_lon")
+            vf_sog = ais.get("ship_sog")
+            vf_cog = ais.get("ship_cog")
+        except:
+            pass
+
+    data = {
         "found": True,
         "destination": destination,
         "last_pos_utc": last_pos_utc,
-        **final_static_data,
+        **static_parsed,
+        "lat": vf_lat,
+        "lon": vf_lon,
+        "sog": vf_sog,
+        "cog": vf_cog,
     }
 
-    # 4. LIVE AIS DATA FROM djson
-    djson_div = soup.find("div", id="djson")
-    if not djson_div or not djson_div.has_attr("data-json"):
-        base_data.update({"lat": None, "lon": None, "sog": None, "cog": None})
-        return base_data
-
-    try:
-        ais = json.loads(djson_div["data-json"])
-    except json.JSONDecodeError:
-        base_data.update({"lat": None, "lon": None, "sog": None, "cog": None})
-        return base_data
-
-    base_data.update(
-        {
-            "lat": ais.get("ship_lat"),
-            "lon": ais.get("ship_lon"),
-            "sog": ais.get("ship_sog"),
-            "cog": ais.get("ship_cog"),
-        }
-    )
-
-    return base_data
+    return data
 
 
+# ─────────────────────────────────────
+# API ENDPOINT
+# ─────────────────────────────────────
 @app.get("/vessel-full/{imo}")
 def vessel_full(imo: str):
     data = scrape_vf_full(imo)

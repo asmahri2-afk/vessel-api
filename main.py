@@ -17,11 +17,8 @@ HEADERS = {
         "Chrome/122.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    # Referer mainly for VF; ShipFinder call will reuse headers
     "Referer": "https://www.vesselfinder.com/",
 }
-
-SHIPFINDER_URL = "https://shipfinder.co/endpoints/shipDeltaUpdate.php"
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -29,11 +26,9 @@ SHIPFINDER_URL = "https://shipfinder.co/endpoints/shipDeltaUpdate.php"
 
 app = FastAPI()
 
-
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,7 +38,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
@@ -52,16 +46,11 @@ async def add_cors_headers(request: Request, call_next):
     response.headers["Access-Control-Allow-Headers"] = "*"
     return response
 
-
 # ============================================================
 # HTML HELPERS – VESSELFINDER
 # ============================================================
 
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
-    """
-    Extract key-value pairs from specific tables based on CSS classes.
-    Looks for rows with label in tpc1/tpx1 and value in tpc2/tpx2.
-    """
     data: Dict[str, str] = {}
     tables = soup.find_all(class_=table_class)
     if not tables:
@@ -78,7 +67,6 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
             if not (label_el and value_el):
                 continue
 
-            # Remove small-tag content like "(m)", "(t)" etc.
             label_parts = [
                 c.strip() for c in label_el.contents if isinstance(c, str)
             ]
@@ -92,11 +80,6 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
 
 def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[str]:
-    """
-    Extract MMSI from inline JS (preferred) or from tables as fallback.
-    JS example: var MMSI=538005492;
-    """
-    # 1) Try inline JS
     for s in soup.find_all("script"):
         if not s.string:
             continue
@@ -104,13 +87,11 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
         if m:
             return m.group(1)
 
-    # 2) Try exact key
     if "MMSI" in static_data:
         v = static_data["MMSI"].strip()
         if v:
             return v
 
-    # 3) Try any label containing MMSI (e.g. "MMSI / Call Sign")
     for key, value in static_data.items():
         if "MMSI" in key.upper():
             v = value.strip()
@@ -119,103 +100,8 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
 
     return None
 
-
 # ============================================================
-# SHIPFINDER HELPERS (USING MMSI + VF POSITION)
-# ============================================================
-
-def make_bounds(lat: float, lon: float, pad: float = 0.7) -> str:
-    """
-    Build ShipFinder bounds string around a center (lat, lon).
-    bounds = south,west,north,east
-    """
-    south = lat - pad
-    west = lon - pad
-    north = lat + pad
-    east = lon + pad
-    return f"{south},{west},{north},{east}"
-
-
-def get_shipfinder_pos(
-    mmsi: str,
-    center_lat: Optional[float],
-    center_lon: Optional[float],
-) -> Optional[Dict[str, Any]]:
-    """
-    Query ShipFinder shipDeltaUpdate endpoint around VF position to get live AIS.
-    Uses the JSON format you provided:
-
-    {
-      "ships": {
-        "636024937": [
-          "28.0988", "-13.6344", "17.8", "35.2", "70", "0", "1765229765"
-        ],
-        ...
-      },
-      "representativeTimestamp": 1765230654,
-      "totalShips": "27223"
-    }
-    """
-    if center_lat is None or center_lon is None:
-        return None
-
-    try:
-        lat_f = float(center_lat)
-        lon_f = float(center_lon)
-    except (TypeError, ValueError):
-        return None
-
-    bounds = make_bounds(lat_f, lon_f)
-    params = {"bounds": bounds}
-
-    sf_headers = dict(HEADERS)
-    sf_headers["Referer"] = "https://shipfinder.co/"
-
-    try:
-        r = requests.get(
-            SHIPFINDER_URL,
-            params=params,
-            headers=sf_headers,
-            timeout=10,
-        )
-    except requests.RequestException:
-        return None
-
-    if r.status_code != 200:
-        return None
-
-    try:
-        data = r.json()
-    except ValueError:
-        return None
-
-    ships = data.get("ships", {})
-    if not isinstance(ships, dict):
-        return None
-
-    rec = ships.get(str(mmsi))
-    if not rec or len(rec) < 7:
-        return None
-
-    try:
-        lat_str, lon_str, sog_str, cog_str, heading_str, status_str, ts_str = rec
-        return {
-            "lat": float(lat_str),
-            "lon": float(lon_str),
-            "sog": float(sog_str),
-            "cog": float(cog_str),
-            "heading": float(heading_str),
-            "nav_status": int(status_str),
-            "timestamp": int(ts_str),
-            "representativeTimestamp": data.get("representativeTimestamp"),
-        }
-    except (ValueError, TypeError):
-        return None
-
-
-
-# ============================================================
-# MAIN SCRAPER – VESSELFINDER + SHIPFINDER FALLBACK
+# MAIN SCRAPER – VESSELFINDER ONLY
 # ============================================================
 
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
@@ -228,7 +114,6 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # 1. CORE INFO
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
@@ -248,11 +133,9 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     vessel_type_el = soup.select_one("h2.vst")
     vessel_type = (
         vessel_type_el.get_text(strip=True).split(",")[0].strip()
-        if vessel_type_el
-        else None
+        if vessel_type_el else None
     )
 
-    # 2. STATIC TABLES
     tech_data = extract_table_data(soup, "tpt1")
     dims_data = extract_table_data(soup, "tptfix")
     static_data = {**tech_data, **dims_data}
@@ -272,33 +155,19 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "beam_m": static_data.get("Beam"),
     }
 
-    # 3. AIS FROM VESSELFINDER
-    vf_lat = vf_lon = vf_sog = vf_cog = None
+    # AIS
+    lat = lon = sog = cog = None
     djson_div = soup.find("div", id="djson")
 
     if djson_div and djson_div.has_attr("data-json"):
         try:
             ais = json.loads(djson_div["data-json"])
-            # Ensure floats (needed for bounds math)
-            ship_lat = ais.get("ship_lat")
-            ship_lon = ais.get("ship_lon")
-            vf_lat = float(ship_lat) if ship_lat is not None else None
-            vf_lon = float(ship_lon) if ship_lon is not None else None
-            vf_sog = ais.get("ship_sog")
-            vf_cog = ais.get("ship_cog")
-        except (json.JSONDecodeError, TypeError, ValueError):
+            lat = ais.get("ship_lat")
+            lon = ais.get("ship_lon")
+            sog = ais.get("ship_sog")
+            cog = ais.get("ship_cog")
+        except:
             pass
-
-    # 4. OPTIONAL OVERRIDE FROM SHIPFINDER (LIVE AIS, USING VF POSITION AS CENTER)
-    sf_data: Optional[Dict[str, Any]] = None
-    if mmsi:
-        sf_data = get_shipfinder_pos(mmsi, vf_lat, vf_lon)
-
-    # Decide final AIS values: ShipFinder preferred if available
-    lat = sf_data["lat"] if sf_data and sf_data.get("lat") is not None else vf_lat
-    lon = sf_data["lon"] if sf_data and sf_data.get("lon") is not None else vf_lon
-    sog = sf_data["sog"] if sf_data and sf_data.get("sog") is not None else vf_sog
-    cog = sf_data["cog"] if sf_data and sf_data.get("cog") is not None else vf_cog
 
     result: Dict[str, Any] = {
         "found": True,
@@ -311,15 +180,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "cog": cog,
     }
 
-    # Optionally expose ShipFinder-specific fields
-    if sf_data:
-        result["sf_heading"] = sf_data.get("heading")
-        result["sf_nav_status"] = sf_data.get("nav_status")
-        result["sf_timestamp"] = sf_data.get("timestamp")
-        result["sf_representative_ts"] = sf_data.get("representativeTimestamp")
-
     return result
-
 
 # ============================================================
 # API ENDPOINT

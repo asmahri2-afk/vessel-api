@@ -143,19 +143,18 @@ def get_shipfinder_pos(
 ) -> Optional[Dict[str, Any]]:
     """
     Query ShipFinder shipDeltaUpdate endpoint around VF position to get live AIS.
-    Returns dict with lat/lon/sog/cog/... or None if not found.
+    Uses the JSON format you provided:
 
-    Expected format (simplified):
-
-      {
-        "352004273": [
-          "27.3859", "-14.0309", "11.9", "212.8", "70", "0", "1765229772"
+    {
+      "ships": {
+        "636024937": [
+          "28.0988", "-13.6344", "17.8", "35.2", "70", "0", "1765229765"
         ],
-        "352004278": [ ... ],
         ...
-      }
-
-    Some variants might wrap this into a "ships" key; we handle both.
+      },
+      "representativeTimestamp": 1765230654,
+      "totalShips": "27223"
+    }
     """
     if center_lat is None or center_lon is None:
         return None
@@ -169,7 +168,6 @@ def get_shipfinder_pos(
     bounds = make_bounds(lat_f, lon_f)
     params = {"bounds": bounds}
 
-    # Reuse HEADERS but a ShipFinder-friendly Referer
     sf_headers = dict(HEADERS)
     sf_headers["Referer"] = "https://shipfinder.co/"
 
@@ -191,14 +189,9 @@ def get_shipfinder_pos(
     except ValueError:
         return None
 
-    # Some responses may be { "ships": { ... }, "representativeTimestamp": ... }
-    # Others may be { "35200...": [ ... ], ... } directly.
-    if isinstance(data, dict) and "ships" in data and isinstance(data["ships"], dict):
-        ships = data["ships"]
-        rep_ts = data.get("representativeTimestamp")
-    else:
-        ships = data if isinstance(data, dict) else {}
-        rep_ts = data.get("representativeTimestamp") if isinstance(data, dict) else None
+    ships = data.get("ships", {})
+    if not isinstance(ships, dict):
+        return None
 
     rec = ships.get(str(mmsi))
     if not rec or len(rec) < 7:
@@ -214,10 +207,11 @@ def get_shipfinder_pos(
             "heading": float(heading_str),
             "nav_status": int(status_str),
             "timestamp": int(ts_str),
-            "representativeTimestamp": rep_ts,
+            "representativeTimestamp": data.get("representativeTimestamp"),
         }
     except (ValueError, TypeError):
         return None
+
 
 
 # ============================================================

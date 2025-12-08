@@ -104,19 +104,19 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPER
+# MYSHIPTRACKING HELPER (FORMAT TEXTE)
 # ============================================================
 
 def get_myshiptracking_pos(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
-    pad: float = 1.5,
+    pad: float = 0.3,  # tu peux monter à 0.5 ou 0.7 si tu veux plus large
 ) -> Optional[Dict[str, Any]]:
     """
-    Utilise l'endpoint MyShipTracking 'vesselsonmaptempTTT.php'
-    dans une petite bbox autour de la position VF, et retourne
-    les infos AIS pour le MMSI donné si trouvé.
+    Appelle vesselsonmaptempTTT.php comme le fait la carte,
+    parse la réponse TEXT (lignes tabulées) et retourne
+    lat/lon/sog/cog pour le MMSI donné.
     """
     if center_lat is None or center_lon is None:
         return None
@@ -147,12 +147,12 @@ def get_myshiptracking_pos(
     })
 
     params = {
-        "type": "json",
+        "type": "json",  # ils s'en fichent, la réponse reste du texte tabulé
         "minlat": minlat,
         "maxlat": maxlat,
         "minlon": minlon,
         "maxlon": maxlon,
-        "zoom": 12,      # comme dans ton payload console
+        "zoom": 15,      # ajustable
         "selid": -1,
         "seltype": 0,
         "timecode": -1,
@@ -175,55 +175,63 @@ def get_myshiptracking_pos(
     if r.status_code != 200:
         return None
 
-    try:
-        data = r.json()
-    except ValueError:
+    body = r.text
+    lines = [l.strip() for l in body.splitlines() if l.strip()]
+    if len(lines) < 3:
         return None
 
-    if not isinstance(data, list):
-        return None
+    # lines[0] = timestamp global
+    # lines[1] = inconnu
+    # lines[2:] = navires + 2/3 lignes de stats à la fin
 
-    candidate = None
-    for ship in data:
-        ship_mmsi = str(
-            ship.get("mmsi")
-            or ship.get("MMSI")
-            or ""
-        ).strip()
-        if ship_mmsi == str(mmsi):
-            candidate = ship
-            break
+    target_mmsi = str(mmsi).strip()
 
-    if not candidate:
-        return None
+    for line in lines[2:]:
+        # on coupe sur TAB d'abord, sinon espaces
+        parts = line.split("\t")
+        if len(parts) == 1:
+            parts = line.split()
 
-    try:
-        lat = float(candidate.get("lat") or candidate.get("LAT"))
-        lon = float(candidate.get("lon") or candidate.get("LON"))
-    except (TypeError, ValueError):
-        return None
+        # on ignore les lignes type "59.4338 0.4542"
+        if len(parts) < 7:
+            continue
 
-    sog = candidate.get("speed") or candidate.get("SPEED") or candidate.get("sog")
-    cog = candidate.get("course") or candidate.get("COURSE") or candidate.get("cog")
+        # d'après ton exemple :
+        # idx, ?, MMSI, NAME, LAT, LON, SOG, COG, ...
+        line_mmsi = parts[2].strip()
 
-    try:
-        sog_f = float(sog) if sog is not None else None
-    except (TypeError, ValueError):
-        sog_f = None
+        if line_mmsi != target_mmsi:
+            continue
 
-    try:
-        cog_f = float(cog) if cog is not None else None
-    except (TypeError, ValueError):
-        cog_f = None
+        try:
+            lat = float(parts[4])
+            lon = float(parts[5])
+        except (TypeError, ValueError):
+            return None
 
-    return {
-        "lat": lat,
-        "lon": lon,
-        "sog": sog_f,
-        "cog": cog_f,
-        "timestamp": candidate.get("lastpos") or candidate.get("LASTPOS"),
-        "mst_raw": candidate,
-    }
+        sog = None
+        cog = None
+
+        try:
+            sog = float(parts[6]) if parts[6] != "" else None
+        except (TypeError, ValueError):
+            sog = None
+
+        if len(parts) > 7:
+            try:
+                cog = float(parts[7]) if parts[7] != "" else None
+            except (TypeError, ValueError):
+                cog = None
+
+        return {
+            "lat": lat,
+            "lon": lon,
+            "sog": sog,
+            "cog": cog,
+        }
+
+    # aucun navire avec ce MMSI dans la bbox
+    return None
 
 # ============================================================
 # MAIN SCRAPER – VESSELFINDER + MYSHIPTRACKING OVERRIDE
@@ -329,9 +337,6 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "cog": cog,
         "ais_source": ais_source,
     }
-
-    if mst_data:
-        result["mst_timestamp"] = mst_data.get("timestamp")
 
     return result
 

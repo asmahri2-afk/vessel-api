@@ -111,7 +111,7 @@ def get_myshiptracking_pos(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
-    pad: float = 0.7,  # tu peux monter à 0.5 ou 0.7 si tu veux plus large
+    pad: float = 0.9,  # tu peux monter à 0.5 ou 0.7 si tu veux plus large
 ) -> Optional[Dict[str, Any]]:
     """
     Appelle vesselsonmaptempTTT.php comme le fait la carte,

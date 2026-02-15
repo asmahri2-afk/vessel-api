@@ -53,6 +53,10 @@ async def add_cors_headers(request: Request, call_next):
 # ============================================================
 
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
+    """
+    Extracts key-value pairs from HTML tables.
+    Handles standard parameter tables (tpc1/tpc2) and live AIS tables (n3/v3).
+    """
     data: Dict[str, str] = {}
     tables = soup.find_all(class_=table_class)
     if not tables:
@@ -60,20 +64,25 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
     for table in tables:
         for row in table.find_all("tr"):
-            # UPDATED: Added 'n3' (label) and 'v3' (value) to support live AIS tables
+            # Look for label cells (classes tpc1, tpx1, or n3)
             label_el = row.find(
                 class_=lambda x: x and ("tpc1" in x or "tpx1" in x or "n3" in x)
             )
+            # Look for value cells (classes tpc2, tpx2, or v3)
             value_el = row.find(
                 class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x)
             )
+            
             if not (label_el and value_el):
                 continue
 
+            # Clean label (remove colons)
             label_parts = [
                 c.strip() for c in label_el.contents if isinstance(c, str)
             ]
             label = " ".join(label_parts).replace(":", "").strip()
+            
+            # Get value text
             value = value_el.get_text(strip=True)
 
             if label:
@@ -83,6 +92,8 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
 
 def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[str]:
+    """Attempts to find MMSI in scripts or scraped data."""
+    # 1. Search in scripts
     for s in soup.find_all("script"):
         if not s.string:
             continue
@@ -90,11 +101,13 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
         if m:
             return m.group(1)
 
+    # 2. Fallback to static data dictionary
     if "MMSI" in static_data:
         v = static_data["MMSI"].strip()
         if v:
             return v
 
+    # 3. Search for keys containing MMSI
     for key, value in static_data.items():
         if "MMSI" in key.upper():
             v = value.strip()
@@ -113,6 +126,11 @@ def get_myshiptracking_pos(
     center_lon: Optional[float],
     pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Fetches position/speed/course from MyShipTracking.
+    NOTE: This function ONLY returns lat, lon, sog, cog.
+    It does NOT return draught, ensuring draught comes exclusively from VesselFinder.
+    """
     if center_lat is None or center_lon is None:
         return None
 
@@ -210,6 +228,7 @@ def get_myshiptracking_pos(
             except (TypeError, ValueError):
                 cog = None
 
+        # Return only navigation data
         return {
             "lat": lat,
             "lon": lon,
@@ -233,6 +252,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
+    # --- Basic Info ---
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
 
@@ -255,15 +275,25 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         if vessel_type_el else None
     )
 
-    # UPDATED: We now scrape the AIS info table (vessel-info-table) for the draught
+    # --- Table Data Extraction (VesselFinder Only) ---
+    # 1. Technical parameters (contains static 'Draught')
     tech_data = extract_table_data(soup, "tpt1")
+    
+    # 2. Dimensions/parameters backup
     dims_data = extract_table_data(soup, "tptfix")
+    
+    # 3. Live AIS Table (contains 'Current draught')
     ais_table_data = extract_table_data(soup, "vessel-info-table") 
     
-    # Merge all scraped tables
+    # Merge all VesselFinder data
     static_data = {**tech_data, **dims_data, **ais_table_data}
 
     mmsi = extract_mmsi(soup, static_data)
+
+    # --- Build Result Dictionary ---
+    # Draught logic: Prefer 'Current draught' (live), fallback to 'Draught' (static).
+    # Both sources are from VesselFinder.
+    draught_val = static_data.get("Current draught") or static_data.get("Draught")
 
     final_static_data: Dict[str, Any] = {
         "imo": imo,
@@ -271,7 +301,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "ship_type": vessel_type,
         "flag": flag,
         "mmsi": mmsi,
-        "draught_m": static_data.get("Current draught") or static_data.get("Draught"), # UPDATED: Added Draught
+        "draught_m": draught_val, 
         "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
         "gross_tonnage": static_data.get("Gross Tonnage"),
         "year_of_build": static_data.get("Year of Build"),
@@ -279,7 +309,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "beam_m": static_data.get("Beam"),
     }
 
-    # AIS VESSELFINDER COORDINATES
+    # --- AIS Coordinates (VesselFinder) ---
     vf_lat = vf_lon = None
     sog = cog = None
     djson_div = soup.find("div", id="djson")
@@ -299,7 +329,9 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # OVERRIDE WITH MYSHIPTRACKING IF POSSIBLE
+    # --- MYSHIPTRACKING OVERRIDE (Position Only) ---
+    # We only override Lat/Lon/Sog/Cog. 
+    # Draught remains strictly from VesselFinder (final_static_data).
     mst_data: Optional[Dict[str, Any]] = None
     if mmsi and vf_lat is not None and vf_lon is not None:
         mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)

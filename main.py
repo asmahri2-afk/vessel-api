@@ -129,7 +129,6 @@ def get_myshiptracking_pos(
     """
     Fetches position/speed/course from MyShipTracking.
     NOTE: This function ONLY returns lat, lon, sog, cog.
-    It does NOT return draught, ensuring draught comes exclusively from VesselFinder.
     """
     if center_lat is None or center_lon is None:
         return None
@@ -228,7 +227,6 @@ def get_myshiptracking_pos(
             except (TypeError, ValueError):
                 cog = None
 
-        # Return only navigation data
         return {
             "lat": lat,
             "lon": lon,
@@ -275,25 +273,24 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         if vessel_type_el else None
     )
 
-    # --- Table Data Extraction (VesselFinder Only) ---
-    # 1. Technical parameters (contains static 'Draught')
+    # --- Table Data Extraction ---
     tech_data = extract_table_data(soup, "tpt1")
-    
-    # 2. Dimensions/parameters backup
     dims_data = extract_table_data(soup, "tptfix")
-    
-    # 3. Live AIS Table (contains 'Current draught')
     ais_table_data = extract_table_data(soup, "vessel-info-table") 
     
-    # Merge all VesselFinder data
     static_data = {**tech_data, **dims_data, **ais_table_data}
-
     mmsi = extract_mmsi(soup, static_data)
 
-    # --- Build Result Dictionary ---
-    # Draught logic: Prefer 'Current draught' (live), fallback to 'Draught' (static).
-    # Both sources are from VesselFinder.
+    # --- DRAUGHT LOGIC (FIX ADDED HERE) ---
+    # 1. Try tables first
     draught_val = static_data.get("Current draught") or static_data.get("Draught")
+
+    # 2. Regex fallback (Reads the description sentence if tables are empty)
+    if not draught_val or draught_val.strip() == "":
+        page_text = soup.get_text()
+        match = re.search(r"(?:draught|draft)\s+of\s+(\d+(?:\.\d+)?)\s*m", page_text, re.IGNORECASE)
+        if match:
+            draught_val = f"{match.group(1)} m"
 
     final_static_data: Dict[str, Any] = {
         "imo": imo,
@@ -301,7 +298,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "ship_type": vessel_type,
         "flag": flag,
         "mmsi": mmsi,
-        "draught_m": draught_val, 
+        "draught_m": draught_val or "", 
         "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
         "gross_tonnage": static_data.get("Gross Tonnage"),
         "year_of_build": static_data.get("Year of Build"),
@@ -329,9 +326,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # --- MYSHIPTRACKING OVERRIDE (Position Only) ---
-    # We only override Lat/Lon/Sog/Cog. 
-    # Draught remains strictly from VesselFinder (final_static_data).
+    # --- MYSHIPTRACKING OVERRIDE ---
     mst_data: Optional[Dict[str, Any]] = None
     if mmsi and vf_lat is not None and vf_lon is not None:
         mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)
@@ -349,7 +344,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         lon = vf_lon
         ais_source = "vesselfinder"
 
-    result: Dict[str, Any] = {
+    return {
         "found": True,
         "destination": destination,
         "last_pos_utc": last_pos_utc,
@@ -360,8 +355,6 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "cog": cog,
         "ais_source": ais_source,
     }
-
-    return result
 
 # ============================================================
 # API ENDPOINT

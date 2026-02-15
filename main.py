@@ -60,11 +60,12 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
     for table in tables:
         for row in table.find_all("tr"):
+            # UPDATED: Added 'n3' (label) and 'v3' (value) to support live AIS tables
             label_el = row.find(
-                class_=lambda x: x and ("tpc1" in x or "tpx1" in x)
+                class_=lambda x: x and ("tpc1" in x or "tpx1" in x or "n3" in x)
             )
             value_el = row.find(
-                class_=lambda x: x and ("tpc2" in x or "tpx2" in x)
+                class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x)
             )
             if not (label_el and value_el):
                 continue
@@ -82,7 +83,6 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
 
 
 def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[str]:
-    # Inline JS: var MMSI=538005492;
     for s in soup.find_all("script"):
         if not s.string:
             continue
@@ -104,20 +104,15 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPER (FORMAT TEXTE)
+# MYSHIPTRACKING HELPER
 # ============================================================
 
 def get_myshiptracking_pos(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
-    pad: float = 0.9,  # tu peux monter à 0.5 ou 0.7 si tu veux plus large
+    pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
-    """
-    Appelle vesselsonmaptempTTT.php comme le fait la carte,
-    parse la réponse TEXT (lignes tabulées) et retourne
-    lat/lon/sog/cog pour le MMSI donné.
-    """
     if center_lat is None or center_lon is None:
         return None
 
@@ -147,12 +142,12 @@ def get_myshiptracking_pos(
     })
 
     params = {
-        "type": "json",  # ils s'en fichent, la réponse reste du texte tabulé
+        "type": "json",
         "minlat": minlat,
         "maxlat": maxlat,
         "minlon": minlon,
         "maxlon": maxlon,
-        "zoom": 15,      # ajustable
+        "zoom": 15,
         "selid": -1,
         "seltype": 0,
         "timecode": -1,
@@ -180,24 +175,16 @@ def get_myshiptracking_pos(
     if len(lines) < 3:
         return None
 
-    # lines[0] = timestamp global
-    # lines[1] = inconnu
-    # lines[2:] = navires + 2/3 lignes de stats à la fin
-
     target_mmsi = str(mmsi).strip()
 
     for line in lines[2:]:
-        # on coupe sur TAB d'abord, sinon espaces
         parts = line.split("\t")
         if len(parts) == 1:
             parts = line.split()
 
-        # on ignore les lignes type "59.4338 0.4542"
         if len(parts) < 7:
             continue
 
-        # d'après ton exemple :
-        # idx, ?, MMSI, NAME, LAT, LON, SOG, COG, ...
         line_mmsi = parts[2].strip()
 
         if line_mmsi != target_mmsi:
@@ -230,7 +217,6 @@ def get_myshiptracking_pos(
             "cog": cog,
         }
 
-    # aucun navire avec ce MMSI dans la bbox
     return None
 
 # ============================================================
@@ -269,9 +255,13 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         if vessel_type_el else None
     )
 
+    # UPDATED: We now scrape the AIS info table (vessel-info-table) for the draught
     tech_data = extract_table_data(soup, "tpt1")
     dims_data = extract_table_data(soup, "tptfix")
-    static_data = {**tech_data, **dims_data}
+    ais_table_data = extract_table_data(soup, "vessel-info-table") 
+    
+    # Merge all scraped tables
+    static_data = {**tech_data, **dims_data, **ais_table_data}
 
     mmsi = extract_mmsi(soup, static_data)
 
@@ -281,6 +271,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "ship_type": vessel_type,
         "flag": flag,
         "mmsi": mmsi,
+        "draught_m": static_data.get("Current draught") or static_data.get("Draught"), # UPDATED: Added Draught
         "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
         "gross_tonnage": static_data.get("Gross Tonnage"),
         "year_of_build": static_data.get("Year of Build"),
@@ -288,7 +279,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         "beam_m": static_data.get("Beam"),
     }
 
-    # AIS VESSELFINDER
+    # AIS VESSELFINDER COORDINATES
     vf_lat = vf_lon = None
     sog = cog = None
     djson_div = soup.find("div", id="djson")
@@ -308,7 +299,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    # OVERRIDE AVEC MYSHIPTRACKING SI POSSIBLE
+    # OVERRIDE WITH MYSHIPTRACKING IF POSSIBLE
     mst_data: Optional[Dict[str, Any]] = None
     if mmsi and vf_lat is not None and vf_lon is not None:
         mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)

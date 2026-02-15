@@ -277,18 +277,21 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     tech_data = extract_table_data(soup, "tpt1")
     dims_data = extract_table_data(soup, "tptfix")
     ais_table_data = extract_table_data(soup, "vessel-info-table") 
+    # FIX: Added 'aparams' table which contains the live data for BBC GREENLAND
+    aparams_data = extract_table_data(soup, "aparams")
     
-    static_data = {**tech_data, **dims_data, **ais_table_data}
+    # Merge all data sources
+    static_data = {**tech_data, **dims_data, **ais_table_data, **aparams_data}
     mmsi = extract_mmsi(soup, static_data)
 
-    # --- DRAUGHT LOGIC (FIX ADDED HERE) ---
-    # 1. Try tables first
+    # --- DRAUGHT LOGIC (UPDATED FIX) ---
+    # 1. Try tables first (checks Current draught and Draught)
     draught_val = static_data.get("Current draught") or static_data.get("Draught")
 
-    # 2. Regex fallback (Reads the description sentence if tables are empty)
+    # 2. Regex fallback (Broadened regex to catch "draught of X.Xm" or "draught X.Xm")
     if not draught_val or draught_val.strip() == "":
         page_text = soup.get_text()
-        match = re.search(r"(?:draught|draft)\s+of\s+(\d+(?:\.\d+)?)\s*m", page_text, re.IGNORECASE)
+        match = re.search(r"(?:draught|draft)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", page_text, re.IGNORECASE)
         if match:
             draught_val = f"{match.group(1)} m"
 

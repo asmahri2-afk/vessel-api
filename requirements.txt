@@ -1,4 +1,6 @@
+curl-cffi
+tenacity
 fastapi
-uvicorn[standard]
+uvicorn
 requests
 beautifulsoup4

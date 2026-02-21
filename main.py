@@ -1,10 +1,25 @@
 import json
 import re
+import random
+import time
+import logging
+from typing import Dict, Any, Optional
+
 import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import curl_cffi.requests as curl_requests
+
+# ============================================================
+# LOGGING CONFIG
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # HTTP CONFIG
@@ -58,7 +73,6 @@ def count_decimals(val: Any) -> int:
         return 0
     s = str(val)
     if "." in s:
-        # Split by dot and remove trailing zeros to get true precision
         return len(s.split(".")[-1].rstrip("0"))
     return 0
 
@@ -71,7 +85,6 @@ def get_vf_age_minutes(age_str: Optional[str]) -> int:
     if "now" in age_str or "just" in age_str:
         return 0
     
-    # Extract numbers
     match = re.search(r"(\d+)", age_str)
     if not match:
         return 999
@@ -128,9 +141,93 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPER
+# EXTERNAL SOURCE HELPERS (with retries and logging)
 # ============================================================
 
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((requests.RequestException, curl_requests.RequestsError)),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying MarineTraffic (attempt {retry_state.attempt_number})...")
+)
+def get_marinetraffic_pos(imo: str) -> Optional[Dict[str, Any]]:
+    """
+    Récupère la position depuis MarineTraffic avec curl_cffi pour imiter le TLS d'un vrai navigateur.
+    Inclut retries et logging.
+    """
+    # Headers ultra-complets (identiques à un vrai Chrome)
+    mt_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+        "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+    }
+
+    # Utilisation d'une session curl_cffi pour conserver les cookies
+    session = curl_requests.Session()
+    session.headers.update(mt_headers)
+
+    try:
+        # Étape 1 : page d'accueil pour obtenir les cookies
+        home_url = "https://www.marinetraffic.com/"
+        logger.info(f"MarineTraffic: fetching homepage for IMO {imo}")
+        session.get(home_url, timeout=15, impersonate="chrome122")
+
+        # Délai aléatoire (simule navigation humaine)
+        time.sleep(random.uniform(1, 3))
+
+        # Étape 2 : page du navire (redirection vers shipid)
+        base_url = f"https://www.marinetraffic.com/en/ais/details/ships/imo:{imo}"
+        logger.info(f"MarineTraffic: fetching vessel page for IMO {imo}")
+        r_info = session.get(base_url, timeout=15, allow_redirects=True, impersonate="chrome122")
+
+        # Extraire shipid de l'URL finale
+        match = re.search(r"shipid:(\d+)", r_info.url)
+        if not match:
+            logger.warning(f"MarineTraffic: shipid not found for IMO {imo}")
+            return None
+        shipid = match.group(1)
+        logger.info(f"MarineTraffic: found shipid {shipid} for IMO {imo}")
+
+        # Étape 3 : appel AJAX pour la position
+        pos_url = f"https://www.marinetraffic.com/en/vessels/{shipid}/position"
+        pos_headers = dict(mt_headers)
+        pos_headers["X-Requested-With"] = "XMLHttpRequest"
+        pos_headers["Accept"] = "application/json"
+
+        r_pos = session.get(pos_url, headers=pos_headers, timeout=15, impersonate="chrome122")
+        if r_pos.status_code == 200:
+            d = r_pos.json()
+            logger.info(f"MarineTraffic: success for IMO {imo}")
+            return {
+                "lat": float(d.get("lat")),
+                "lon": float(d.get("lon")),
+                "sog": float(d.get("speed")) if d.get("speed") is not None else None,
+                "cog": float(d.get("course")) if d.get("course") is not None else None
+            }
+        else:
+            logger.warning(f"MarineTraffic: position endpoint returned {r_pos.status_code} for IMO {imo}")
+            return None
+    except Exception as e:
+        logger.error(f"MarineTraffic: exception for IMO {imo}: {e}")
+        raise  # pour que tenacity retry
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(requests.RequestException),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying MyShipTracking (attempt {retry_state.attempt_number})...")
+)
 def get_myshiptracking_pos(
     mmsi: str,
     center_lat: Optional[float],
@@ -143,6 +240,7 @@ def get_myshiptracking_pos(
     try:
         lat_f, lon_f = float(center_lat), float(center_lon)
     except (TypeError, ValueError):
+        logger.warning(f"MyShipTracking: invalid center coordinates for MMSI {mmsi}")
         return None
 
     params = {
@@ -162,23 +260,31 @@ def get_myshiptracking_pos(
     mst_headers["Referer"] = "https://www.myshiptracking.com/"
 
     try:
+        logger.info(f"MyShipTracking: querying for MMSI {mmsi}")
         r = requests.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
-        if r.status_code != 200: return None
+        if r.status_code != 200:
+            logger.warning(f"MyShipTracking: returned {r.status_code} for MMSI {mmsi}")
+            return None
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
-        if len(lines) < 3: return None
+        if len(lines) < 3:
+            logger.debug(f"MyShipTracking: insufficient lines for MMSI {mmsi}")
+            return None
 
         target_mmsi = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
             if len(parts) >= 7 and parts[2].strip() == target_mmsi:
+                logger.info(f"MyShipTracking: found position for MMSI {mmsi}")
                 return {
                     "lat": float(parts[4]), "lon": float(parts[5]),
                     "sog": float(parts[6]) if parts[6] != "" else None,
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
                 }
-    except Exception:
+        logger.debug(f"MyShipTracking: MMSI {mmsi} not found in response")
         return None
-    return None
+    except Exception as e:
+        logger.error(f"MyShipTracking: exception for MMSI {mmsi}: {e}")
+        raise  # pour retry
 
 # ============================================================
 # MAIN SCRAPER – SMART MERGE LOGIC
@@ -186,11 +292,18 @@ def get_myshiptracking_pos(
 
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+    except requests.RequestException as e:
+        logger.error(f"VesselFinder request failed for IMO {imo}: {e}")
+        return {"found": False, "imo": imo, "error": str(e)}
 
     if r.status_code == 404:
+        logger.info(f"VesselFinder: IMO {imo} not found")
         return {"found": False, "imo": imo}
-    r.raise_for_status()
+    if r.status_code != 200:
+        logger.warning(f"VesselFinder returned {r.status_code} for IMO {imo}")
+        return {"found": False, "imo": imo, "error": f"HTTP {r.status_code}"}
 
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -238,36 +351,46 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
             vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
             vf_lon = float(ais.get("ship_lon")) if ais.get("ship_lon") else None
             sog, cog = ais.get("ship_sog"), ais.get("ship_cog")
-        except: pass
+        except Exception as e:
+            logger.warning(f"VesselFinder: failed to parse djson for IMO {imo}: {e}")
 
-    # --- SMART MERGE LOGIC ---
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon) if (mmsi and vf_lat) else None
+    # --- SMART MERGE LOGIC (with MarineTraffic) ---
+    mt_data = None
+    try:
+        mt_data = get_marinetraffic_pos(imo)
+    except Exception as e:
+        logger.error(f"All MarineTraffic retries failed for IMO {imo}: {e}")
+
+    mst_data = None
+    if mmsi and vf_lat:
+        try:
+            mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)
+        except Exception as e:
+            logger.error(f"All MyShipTracking retries failed for MMSI {mmsi}: {e}")
     
-    use_mst = False
     vf_age = get_vf_age_minutes(last_pos_utc)
     
-    if mst_data:
-        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon)
-        mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-        
-        # Decision Rules:
-        if vf_lat is None:
-            use_mst = True  # VF failed, use MST
-        elif vf_age > 60:
-            use_mst = True  # VF data is older than 1 hour, prefer fresh MST even if rounded
-        elif mst_precision > vf_precision and vf_age > 5:
-            use_mst = True  # MST has better decimals AND VF isn't brand new
-        else:
-            use_mst = False # VF is precise or very fresh, stick with it
-
-    if use_mst and mst_data:
+    # Priority 1: MarineTraffic
+    if mt_data:
+        lat, lon = mt_data["lat"], mt_data["lon"]
+        sog = mt_data.get("sog", sog)
+        cog = mt_data.get("cog", cog)
+        ais_source = "marinetraffic"
+        logger.info(f"IMO {imo}: using MarineTraffic position")
+    
+    # Priority 2: MyShipTracking (if VF old or missing)
+    elif mst_data and (vf_lat is None or vf_age > 60):
         lat, lon = mst_data["lat"], mst_data["lon"]
         sog = mst_data.get("sog", sog)
         cog = mst_data.get("cog", cog)
         ais_source = "myshiptracking"
+        logger.info(f"IMO {imo}: using MyShipTracking position")
+        
+    # Priority 3: VesselFinder
     else:
         lat, lon = vf_lat, vf_lon
         ais_source = "vesselfinder"
+        logger.info(f"IMO {imo}: using VesselFinder position")
 
     return {
         "found": True,
@@ -288,4 +411,3 @@ def vessel_full(imo: str):
     if not data.get("found"):
         raise HTTPException(status_code=404, detail="Vessel not found")
     return data
-    

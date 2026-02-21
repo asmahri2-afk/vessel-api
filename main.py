@@ -68,7 +68,7 @@ async def add_cors_headers(request: Request, call_next):
 # ============================================================
 
 def count_decimals(val: Any) -> int:
-    """Counts decimal places to determine coordinate precision."""
+    """Counts decimal places to determine coordinate precisions."""
     if val is None:
         return 0
     s = str(val)

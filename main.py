@@ -1,10 +1,21 @@
 import json
 import re
 import requests
+import asyncio
+import websockets
+import logging
+import os
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Dict, Any, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+# ============================================================
+# LOGGING CONFIG
+# ============================================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # HTTP CONFIG
@@ -21,6 +32,11 @@ HEADERS = {
 }
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
+
+# ============================================================
+# AISSTREAM CONFIG (via environnement)
+# ============================================================
+AISSTREAM_API_KEY = os.environ.get("AISSTREAM_API_KEY", "928b33be84745728566f4d4c9628386b0989eca3")  # À remplacer par votre clé
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -58,7 +74,6 @@ def count_decimals(val: Any) -> int:
         return 0
     s = str(val)
     if "." in s:
-        # Split by dot and remove trailing zeros to get true precision
         return len(s.split(".")[-1].rstrip("0"))
     return 0
 
@@ -66,22 +81,24 @@ def get_vf_age_minutes(age_str: Optional[str]) -> int:
     """Parses VesselFinder age strings like '3 min ago' or '2 hours ago'."""
     if not age_str:
         return 999
-    
     age_str = age_str.lower()
     if "now" in age_str or "just" in age_str:
         return 0
-    
-    # Extract numbers
     match = re.search(r"(\d+)", age_str)
     if not match:
         return 999
-    
     value = int(match.group(1))
     if "hour" in age_str:
         return value * 60
     if "day" in age_str:
         return value * 1440
     return value
+
+def is_valid_coordinates(lat: Optional[float], lon: Optional[float]) -> bool:
+    """Vérifie que les coordonnées sont plausibles."""
+    if lat is None or lon is None:
+        return False
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
 
 # ============================================================
 # HTML HELPERS – VESSELFINDER
@@ -101,14 +118,11 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
             value_el = row.find(
                 class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x)
             )
-            
             if not (label_el and value_el):
                 continue
-
             label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
             label = " ".join(label_parts).replace(":", "").strip()
             value = value_el.get_text(strip=True)
-
             if label:
                 data[label] = value
     return data
@@ -139,7 +153,6 @@ def get_myshiptracking_pos(
 ) -> Optional[Dict[str, Any]]:
     if center_lat is None or center_lon is None:
         return None
-
     try:
         lat_f, lon_f = float(center_lat), float(center_lon)
     except (TypeError, ValueError):
@@ -157,7 +170,6 @@ def get_myshiptracking_pos(
             "mapflt_from": "", "mapflt_dest": "",
         }),
     }
-
     mst_headers = dict(HEADERS)
     mst_headers["Referer"] = "https://www.myshiptracking.com/"
 
@@ -166,7 +178,6 @@ def get_myshiptracking_pos(
         if r.status_code != 200: return None
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
         if len(lines) < 3: return None
-
         target_mmsi = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
@@ -176,19 +187,87 @@ def get_myshiptracking_pos(
                     "sog": float(parts[6]) if parts[6] != "" else None,
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
                 }
-    except Exception:
-        return None
+    except Exception as e:
+        logger.error(f"MyShipTracking error for MMSI {mmsi}: {e}")
     return None
 
 # ============================================================
-# MAIN SCRAPER – SMART MERGE LOGIC
+# AISSTREAM HELPER (temps réel)
+# ============================================================
+
+@retry(
+    stop=stop_after_attempt(2),
+    wait=wait_exponential(multiplier=1, min=2, max=5),
+    retry=retry_if_exception_type((websockets.WebSocketException, asyncio.TimeoutError, ConnectionError)),
+    before_sleep=lambda retry_state: logger.warning(f"Retrying AISStream (attempt {retry_state.attempt_number})...")
+)
+def get_aisstream_pos(mmsi: str) -> Optional[Dict[str, Any]]:
+    """Récupère la dernière position via AISStream.io (WebSocket)."""
+    if not mmsi or not AISSTREAM_API_KEY:
+        logger.warning("AISStream: MMSI ou API key manquant")
+        return None
+
+    async def fetch():
+        try:
+            async with asyncio.timeout(20):
+                async with websockets.connect("wss://stream.aisstream.io/v0/stream", ping_interval=None) as websocket:
+                    subscribe_message = {
+                        "APIKey": AISSTREAM_API_KEY,
+                        "BoundingBoxes": [[[-90, -180], [90, 180]]],
+                        "FiltersShipMMSI": [str(mmsi)],
+                        "FilterMessageTypes": ["PositionReport"]
+                    }
+                    await websocket.send(json.dumps(subscribe_message))
+                    logger.debug(f"AISStream subscription sent for MMSI {mmsi}")
+
+                    try:
+                        message_json = await asyncio.wait_for(websocket.recv(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.info(f"AISStream: timeout waiting for message for MMSI {mmsi}")
+                        return None
+
+                    message = json.loads(message_json)
+                    if "error" in message:
+                        logger.error(f"AISStream error for MMSI {mmsi}: {message['error']}")
+                        return None
+
+                    if message.get("MessageType") == "PositionReport":
+                        ais_message = message['Message']['PositionReport']
+                        return {
+                            "lat": float(ais_message['Latitude']),
+                            "lon": float(ais_message['Longitude']),
+                            "sog": float(ais_message.get('Sog')) if ais_message.get('Sog') is not None else None,
+                            "cog": float(ais_message.get('Cog')) if ais_message.get('Cog') is not None else None,
+                        }
+                    else:
+                        logger.debug(f"AISStream: received non-position message: {message.get('MessageType')}")
+                        return None
+        except Exception as e:
+            logger.error(f"AISStream exception for MMSI {mmsi}: {e}")
+            raise
+
+    # Gestion de la boucle asyncio
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    return loop.run_until_complete(fetch())
+
+# ============================================================
+# MAIN SCRAPER – SMART MERGE LOGIC (avec AISStream)
 # ============================================================
 
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+    except requests.RequestException as e:
+        logger.error(f"VesselFinder request failed for IMO {imo}: {e}")
+        return {"found": False, "imo": imo, "error": str(e)}
 
     if r.status_code == 404:
+        logger.info(f"VesselFinder: IMO {imo} not found")
         return {"found": False, "imo": imo}
     r.raise_for_status()
 
@@ -238,36 +317,54 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
             vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
             vf_lon = float(ais.get("ship_lon")) if ais.get("ship_lon") else None
             sog, cog = ais.get("ship_sog"), ais.get("ship_cog")
-        except: pass
+        except Exception as e:
+            logger.warning(f"VesselFinder: failed to parse djson for IMO {imo}: {e}")
 
-    # --- SMART MERGE LOGIC ---
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon) if (mmsi and vf_lat) else None
-    
-    use_mst = False
+    # --- Nouvelle source AISStream ---
+    aisstream_data = None
+    if mmsi and AISSTREAM_API_KEY:
+        try:
+            aisstream_data = get_aisstream_pos(mmsi)
+            logger.info(f"aisstream_data for IMO {imo}: {aisstream_data}")
+        except Exception as e:
+            logger.error(f"AISStream failed for MMSI {mmsi}: {e}")
+
+    # --- MyShipTracking ---
+    mst_data = None
+    if mmsi and vf_lat:
+        try:
+            mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon)
+            logger.info(f"mst_data for IMO {imo}: {mst_data}")
+        except Exception as e:
+            logger.error(f"MyShipTracking failed for MMSI {mmsi}: {e}")
+
     vf_age = get_vf_age_minutes(last_pos_utc)
-    
-    if mst_data:
-        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon)
-        mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-        
-        # Decision Rules:
-        if vf_lat is None:
-            use_mst = True  # VF failed, use MST
-        elif vf_age > 60:
-            use_mst = True  # VF data is older than 1 hour, prefer fresh MST even if rounded
-        elif mst_precision > vf_precision and vf_age > 5:
-            use_mst = True  # MST has better decimals AND VF isn't brand new
-        else:
-            use_mst = False # VF is precise or very fresh, stick with it
 
-    if use_mst and mst_data:
-        lat, lon = mst_data["lat"], mst_data["lon"]
-        sog = mst_data.get("sog", sog)
-        cog = mst_data.get("cog", cog)
-        ais_source = "myshiptracking"
+    # --- SMART MERGE avec priorité AISStream ---
+    selected = None
+
+    # 1. AISStream (données temps réel)
+    if aisstream_data and is_valid_coordinates(aisstream_data.get("lat"), aisstream_data.get("lon")):
+        selected = ("aisstream", aisstream_data)
+
+    # 2. MyShipTracking (si VF est vieux ou absent)
+    elif mst_data and is_valid_coordinates(mst_data.get("lat"), mst_data.get("lon")) and (vf_lat is None or vf_age > 60):
+        selected = ("myshiptracking", mst_data)
+
+    # 3. VesselFinder (fallback)
+    elif vf_lat is not None and vf_lon is not None and is_valid_coordinates(vf_lat, vf_lon):
+        selected = ("vesselfinder", {"lat": vf_lat, "lon": vf_lon, "sog": sog, "cog": cog})
+
+    if selected:
+        ais_source, data = selected
+        lat, lon = data["lat"], data["lon"]
+        sog = data.get("sog", sog)
+        cog = data.get("cog", cog)
+        logger.info(f"IMO {imo}: using {ais_source} position: {lat}, {lon}")
     else:
-        lat, lon = vf_lat, vf_lon
-        ais_source = "vesselfinder"
+        lat = lon = sog = cog = None
+        ais_source = "none"
+        logger.warning(f"IMO {imo}: no valid position source")
 
     return {
         "found": True,
@@ -288,4 +385,3 @@ def vessel_full(imo: str):
     if not data.get("found"):
         raise HTTPException(status_code=404, detail="Vessel not found")
     return data
-    

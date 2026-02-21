@@ -221,7 +221,7 @@ def get_aisstream_pos(mmsi: str) -> Optional[Dict[str, Any]]:
                     logger.debug(f"AISStream subscription sent for MMSI {mmsi}")
 
                     try:
-                        message_json = await asyncio.wait_for(websocket.recv(), timeout=15.0)
+                        message_json = await asyncio.wait_for(websocket.recv(), timeout=8.0)  # Timeout réduit à 8s
                     except asyncio.TimeoutError:
                         logger.info(f"AISStream: timeout waiting for message for MMSI {mmsi}")
                         return None
@@ -255,7 +255,7 @@ def get_aisstream_pos(mmsi: str) -> Optional[Dict[str, Any]]:
     return loop.run_until_complete(fetch())
 
 # ============================================================
-# MAIN SCRAPER – SMART MERGE LOGIC (avec AISStream)
+# MAIN SCRAPER – SMART MERGE LOGIC (avec AISStream et précision)
 # ============================================================
 
 def scrape_vf_full(imo: str) -> Dict[str, Any]:
@@ -340,20 +340,30 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
 
     vf_age = get_vf_age_minutes(last_pos_utc)
 
-    # --- SMART MERGE avec priorité AISStream ---
+    # --- Sélection de la source avec priorité AISStream et comparaison de précision ---
     selected = None
 
-    # 1. AISStream (données temps réel)
+    # 1. AISStream (temps réel)
     if aisstream_data and is_valid_coordinates(aisstream_data.get("lat"), aisstream_data.get("lon")):
         selected = ("aisstream", aisstream_data)
 
-    # 2. MyShipTracking (si VF est vieux ou absent)
-    elif mst_data and is_valid_coordinates(mst_data.get("lat"), mst_data.get("lon")) and (vf_lat is None or vf_age > 60):
-        selected = ("myshiptracking", mst_data)
+    # 2. MyShipTracking ou VesselFinder
+    else:
+        vf_valid = vf_lat is not None and vf_lon is not None and is_valid_coordinates(vf_lat, vf_lon)
+        mst_valid = mst_data and is_valid_coordinates(mst_data["lat"], mst_data["lon"])
 
-    # 3. VesselFinder (fallback)
-    elif vf_lat is not None and vf_lon is not None and is_valid_coordinates(vf_lat, vf_lon):
-        selected = ("vesselfinder", {"lat": vf_lat, "lon": vf_lon, "sog": sog, "cog": cog})
+        if mst_valid and vf_valid:
+            # Les deux sont valides, on compare
+            vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon)
+            mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
+            if vf_age > 60 or mst_precision > vf_precision:
+                selected = ("myshiptracking", mst_data)
+            else:
+                selected = ("vesselfinder", {"lat": vf_lat, "lon": vf_lon, "sog": sog, "cog": cog})
+        elif mst_valid:
+            selected = ("myshiptracking", mst_data)
+        elif vf_valid:
+            selected = ("vesselfinder", {"lat": vf_lat, "lon": vf_lon, "sog": sog, "cog": cog})
 
     if selected:
         ais_source, data = selected

@@ -2,10 +2,12 @@
 Vessel Tracker API - Production Ready Version
 ==============================================
 Fetches vessel information and AIS position data from VesselFinder and MyShipTracking.
+Ajoute un proxy WebSocket pour AISStream.
 
 Usage:
     Set environment variables (optional):
     - LOG_LEVEL: Logging level (default: INFO)
+    - AISSTREAM_API_KEY: Your AISStream API key
     
     Run: uvicorn vessel_tracker:app --host 0.0.0.0 --port 8000
 """
@@ -18,49 +20,11 @@ from typing import Dict, Any, Optional
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import FastAPI, HTTPException, Path, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
-from fastapi import WebSocket, WebSocketDisconnect
 import websockets
-import json
 
-AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
-# Idéalement, lisez la clé depuis une variable d'environnement
-AISSTREAM_API_KEY = "928b33be84745728566f4d4c9628386b0989eca3"
-
-@app.websocket("/ws/ais-stream")
-async def websocket_ais_stream(websocket: WebSocket):
-    await websocket.accept()
-    print("Frontend client connected to proxy")
-
-    try:
-        # Connexion à AISStream
-        async with websockets.connect(AISSTREAM_URL) as ais_ws:
-            print("Connected to AISStream")
-
-            # Envoyer la souscription
-            subscription = {
-                "APIKey": AISSTREAM_API_KEY,
-                "BoundingBoxes": [[[-90, -180], [90, 180]]],
-                "FilterMessageTypes": ["PositionReport"]
-            }
-            await ais_ws.send(json.dumps(subscription))
-            print("Subscription sent to AISStream")
-
-            # Relayer les messages
-            async for message in ais_ws:
-                # Vous pouvez filtrer ici si besoin
-                await websocket.send_text(message)
-
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"AISStream connection closed: {e}")
-    except WebSocketDisconnect:
-        print("Frontend client disconnected")
-    except Exception as e:
-        print(f"Error in WebSocket proxy: {e}")
-    finally:
-        print("WebSocket proxy closed")
 # ============================================================
 # LOGGING CONFIG
 # ============================================================
@@ -105,9 +69,49 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure this for production
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "WEBSOCKET"],  # Ajout de WEBSOCKET pour les connexions WebSocket
     allow_headers=["*"],
 )
+
+# ============================================================
+# WEBSOCKET PROXY FOR AISSTREAM
+# ============================================================
+AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
+# Lire la clé depuis l'environnement, avec une valeur par défaut pour le test
+AISSTREAM_API_KEY = os.getenv("AISSTREAM_API_KEY", "928b33be84745728566f4d4c9628386b0989eca3")
+
+@app.websocket("/ws/ais-stream")
+async def websocket_ais_stream(websocket: WebSocket):
+    await websocket.accept()
+    print("Frontend client connected to proxy")
+
+    try:
+        # Connexion à AISStream
+        async with websockets.connect(AISSTREAM_URL) as ais_ws:
+            print("Connected to AISStream")
+
+            # Envoyer la souscription
+            subscription = {
+                "APIKey": AISSTREAM_API_KEY,
+                "BoundingBoxes": [[[-90, -180], [90, 180]]],
+                "FilterMessageTypes": ["PositionReport"]
+            }
+            await ais_ws.send(json.dumps(subscription))
+            print("Subscription sent to AISStream")
+
+            # Relayer les messages
+            async for message in ais_ws:
+                # Vous pouvez filtrer ici si besoin
+                await websocket.send_text(message)
+
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"AISStream connection closed: {e}")
+    except WebSocketDisconnect:
+        print("Frontend client disconnected")
+    except Exception as e:
+        print(f"Error in WebSocket proxy: {e}")
+    finally:
+        print("WebSocket proxy closed")
 
 # ============================================================
 # PYDANTIC MODELS

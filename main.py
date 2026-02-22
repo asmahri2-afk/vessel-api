@@ -219,7 +219,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
         if match: draught_val = f"{match.group(1)} m"
 
     final_static_data = {
-        "imo": imo, "vessel_name": name, "ship_type": static_data.get("Ship type") or "",
+        "imo": imo, "vessel_name": name, "ship_type": static_data.get("Ship Type") or static_data.get("Ship type") or static_data.get("Type") or "",
         "flag": (soup.select_one("div.title-flag-icon").get("title") if soup.select_one("div.title-flag-icon") else None),
         "mmsi": mmsi, "draught_m": draught_val or "",
         "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),

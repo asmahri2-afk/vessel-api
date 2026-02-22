@@ -21,7 +21,46 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from fastapi import WebSocket, WebSocketDisconnect
+import websockets
+import json
 
+AISSTREAM_URL = "wss://stream.aisstream.io/v0/stream"
+# Idéalement, lisez la clé depuis une variable d'environnement
+AISSTREAM_API_KEY = "928b33be84745728566f4d4c9628386b0989eca3"
+
+@app.websocket("/ws/ais-stream")
+async def websocket_ais_stream(websocket: WebSocket):
+    await websocket.accept()
+    print("Frontend client connected to proxy")
+
+    try:
+        # Connexion à AISStream
+        async with websockets.connect(AISSTREAM_URL) as ais_ws:
+            print("Connected to AISStream")
+
+            # Envoyer la souscription
+            subscription = {
+                "APIKey": AISSTREAM_API_KEY,
+                "BoundingBoxes": [[[-90, -180], [90, 180]]],
+                "FilterMessageTypes": ["PositionReport"]
+            }
+            await ais_ws.send(json.dumps(subscription))
+            print("Subscription sent to AISStream")
+
+            # Relayer les messages
+            async for message in ais_ws:
+                # Vous pouvez filtrer ici si besoin
+                await websocket.send_text(message)
+
+    except websockets.exceptions.ConnectionClosed as e:
+        print(f"AISStream connection closed: {e}")
+    except WebSocketDisconnect:
+        print("Frontend client disconnected")
+    except Exception as e:
+        print(f"Error in WebSocket proxy: {e}")
+    finally:
+        print("WebSocket proxy closed")
 # ============================================================
 # LOGGING CONFIG
 # ============================================================

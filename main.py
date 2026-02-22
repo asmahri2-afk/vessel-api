@@ -471,7 +471,7 @@ def scrape_vesselfinder(imo: str) -> Dict[str, Any]:
         "imo": imo,
         "vessel_name": name,
         "mmsi": mmsi,
-        "ship_type": static_data.get("Ship type", ""),
+        "ship_type": static_data.get("Ship type") or static_data.get("Type") or static_data.get("Vessel type") or "",
         "flag": flag,
         "lat": lat,
         "lon": lon,

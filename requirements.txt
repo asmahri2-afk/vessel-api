@@ -1,7 +1,4 @@
-curl-cffi
-tenacity
 fastapi
 uvicorn
 requests
 beautifulsoup4
-websockets

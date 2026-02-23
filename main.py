@@ -245,20 +245,21 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
     
     use_mst = False
     vf_age = get_vf_age_minutes(last_pos_utc)
+    MAX_VF_AGE = 60   # minutes – if VF data is older than this, we ignore it
     
     if mst_data:
-        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon)
+        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
         mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
         
         # Decision Rules:
         if vf_lat is None:
-            use_mst = True  # VF failed, use MST
-        elif vf_age > 60:
-            use_mst = True  # VF data is older than 1 hour, prefer fresh MST even if rounded
-        elif mst_precision > vf_precision and vf_age > 5:
-            use_mst = True  # MST has better decimals AND VF isn't brand new
+            use_mst = True                     # VF has no position, use MST
+        elif vf_age > MAX_VF_AGE:
+            use_mst = True                     # VF data too old, use MST regardless of precision
+        elif mst_precision > vf_precision:
+            use_mst = True                     # MST is more precise, prefer it
         else:
-            use_mst = False # VF is precise or very fresh, stick with it
+            use_mst = False                    # VF is fresher/equally precise, keep VF
 
     if use_mst and mst_data:
         lat, lon = mst_data["lat"], mst_data["lon"]

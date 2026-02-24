@@ -240,7 +240,7 @@ def scrape_vf_full(imo: str) -> Dict[str, Any]:
             sog, cog = ais.get("ship_sog"), ais.get("ship_cog")
         except: pass
 
-    # --- SMART MERGE LOGIC ---
+       # --- SMART MERGE LOGIC ---
     mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon) if (mmsi and vf_lat) else None
     
     use_mst = False

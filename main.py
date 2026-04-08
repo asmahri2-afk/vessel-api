@@ -3,11 +3,13 @@ import logging
 import os
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Dict, Any, Optional
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
 
 # ============================================================
 # LOGGING
@@ -36,8 +38,11 @@ HEADERS = {
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
 
-# FIX #5: Simple API key auth — set this as an env var on Render
-API_SECRET = os.getenv("API_SECRET", "")
+API_SECRET  = os.getenv("API_SECRET", "")
+
+# Max parallel workers for batch — keep low to avoid hammering VesselFinder
+BATCH_MAX_WORKERS = 4
+BATCH_MAX_IMOS    = 50  # safety cap per batch request
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -45,7 +50,6 @@ API_SECRET = os.getenv("API_SECRET", "")
 
 app = FastAPI()
 
-# FIX #2: Single CORS middleware only — removed duplicate custom middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -55,11 +59,17 @@ app.add_middleware(
 )
 
 # ============================================================
+# REQUEST MODELS
+# ============================================================
+
+class BatchRequest(BaseModel):
+    imos: List[str]
+
+# ============================================================
 # UTILITY HELPERS
 # ============================================================
 
 def count_decimals(val: Any) -> int:
-    """Counts decimal places to determine coordinate precision."""
     if val is None:
         return 0
     s = str(val)
@@ -67,9 +77,7 @@ def count_decimals(val: Any) -> int:
         return len(s.split(".")[-1].rstrip("0"))
     return 0
 
-# FIX #1: Replaced broken get_vf_age_minutes() with real timestamp parser
 def parse_vf_timestamp(ts: Optional[str]) -> Optional[datetime]:
-    """Parses VesselFinder timestamps like 'Mar 07, 2026 00:05 UTC'."""
     if not ts:
         return None
     ts = ts.replace(" UTC", "").strip()
@@ -82,7 +90,6 @@ def parse_vf_timestamp(ts: Optional[str]) -> Optional[datetime]:
     return None
 
 def get_vf_age_minutes(last_pos_utc: Optional[str]) -> int:
-    """Returns age of VesselFinder position in minutes. Returns 999 if unparseable."""
     dt = parse_vf_timestamp(last_pos_utc)
     if not dt:
         return 999
@@ -93,7 +100,6 @@ def get_vf_age_minutes(last_pos_utc: Optional[str]) -> int:
 # INPUT VALIDATION
 # ============================================================
 
-# FIX #3: Validate IMO before making any external requests
 def validate_imo(imo: str) -> bool:
     imo = str(imo).strip()
     if not re.match(r'^\d{7}$', imo):
@@ -168,7 +174,6 @@ def get_myshiptracking_pos(
     except (TypeError, ValueError):
         return None
 
-    # FIX #9: Use current year dynamically instead of hardcoded 2025
     current_year = datetime.now().year
 
     params = {
@@ -188,7 +193,6 @@ def get_myshiptracking_pos(
     mst_headers["Referer"] = "https://www.myshiptracking.com/"
 
     try:
-        # FIX #6: Use session for connection reuse
         r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
         if r.status_code != 200:
             logger.warning(f"MyShipTracking returned status {r.status_code} for MMSI {mmsi}")
@@ -209,20 +213,18 @@ def get_myshiptracking_pos(
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
                 }
 
-    # FIX #7: Log MST failures instead of silently passing
     except Exception as e:
         logger.warning(f"MyShipTracking fetch failed for MMSI {mmsi}: {e}")
 
     return None
 
 # ============================================================
-# MAIN SCRAPER – SMART MERGE LOGIC
+# MAIN SCRAPER
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
 
-    # FIX #6: Use session for connection reuse
     r = session.get(url, headers=HEADERS, timeout=20)
 
     if r.status_code == 404:
@@ -232,7 +234,6 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # --- Basic Info ---
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
     dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
@@ -242,7 +243,6 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
     logger.info(f"IMO {imo} | name={name} | last_pos_utc={last_pos_utc}")
 
-    # --- Static Data ---
     tech_data      = extract_table_data(soup, "tpt1")
     dims_data      = extract_table_data(soup, "tptfix")
     ais_table_data = extract_table_data(soup, "vessel-info-table")
@@ -250,7 +250,6 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     static_data    = {**tech_data, **dims_data, **ais_table_data, **aparams_data}
     mmsi           = extract_mmsi(soup, static_data)
 
-    # Draught
     draught_val = static_data.get("Current draught") or static_data.get("Draught")
     if not draught_val:
         match = re.search(r"(?:draught|draft)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", soup.get_text(), re.IGNORECASE)
@@ -271,11 +270,9 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         "beam_m": static_data.get("Beam"),
     }
 
-    # --- VesselFinder AIS Extraction ---
     vf_lat = vf_lon = sog = cog = None
     djson_div = soup.find("div", id="djson")
     if djson_div and djson_div.has_attr("data-json"):
-        # FIX #4: Log AIS parse failures instead of silently passing
         try:
             ais = json.loads(djson_div["data-json"])
             vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
@@ -286,12 +283,10 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # --- SMART MERGE LOGIC ---
     mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session) if (mmsi and vf_lat) else None
 
-    use_mst  = False
-    # FIX #1: vf_age now correctly computed from real timestamp
-    vf_age   = get_vf_age_minutes(last_pos_utc)
+    use_mst = False
+    vf_age  = get_vf_age_minutes(last_pos_utc)
     MAX_VF_AGE = 60
 
     if mst_data:
@@ -332,28 +327,31 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     }
 
 # ============================================================
-# API ENDPOINT
+# API ENDPOINTS
 # ============================================================
 
-@app.get("/ping")
-def ping():
-    return {"ok": True}
-
-@app.get("/vessel-full/{imo}")
-def vessel_full(imo: str, request: Request):
-    # FIX #5: Simple API key check — header X-API-Secret must match env var
+def _check_auth(request: Request, imo: str = ""):
+    """Shared auth check for all endpoints."""
     if API_SECRET:
         client_secret = request.headers.get("X-API-Secret", "")
         if client_secret != API_SECRET:
             logger.warning(f"Unauthorized request for IMO {imo} from {request.client.host}")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # FIX #3: Validate IMO format and checksum before hitting VesselFinder
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
+
+
+@app.get("/vessel-full/{imo}")
+def vessel_full(imo: str, request: Request):
+    _check_auth(request, imo)
+
     if not validate_imo(imo):
         logger.warning(f"Invalid IMO rejected: {imo}")
         raise HTTPException(status_code=400, detail="Invalid IMO number")
 
-    # FIX #6: Session per request for connection reuse within one scrape
     with requests.Session() as session:
         try:
             data = scrape_vf_full(imo, session)
@@ -365,3 +363,59 @@ def vessel_full(imo: str, request: Request):
         raise HTTPException(status_code=404, detail="Vessel not found")
 
     return data
+
+
+@app.post("/vessel-batch")
+def vessel_batch(body: BatchRequest, request: Request):
+    """
+    Fetch multiple vessels in parallel.
+    POST /vessel-batch
+    Body: {"imos": ["9427079", "9437854", ...]}
+    Returns: {"results": {"9427079": {...}, "9437854": {...}}, "errors": {"bad_imo": "reason"}}
+    """
+    _check_auth(request)
+
+    # Validate and deduplicate
+    imos = list(dict.fromkeys(body.imos))  # preserve order, remove duplicates
+
+    if len(imos) > BATCH_MAX_IMOS:
+        raise HTTPException(status_code=400, detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch")
+
+    invalid = [imo for imo in imos if not validate_imo(imo)]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Invalid IMOs: {', '.join(invalid)}")
+
+    results: Dict[str, Any] = {}
+    errors:  Dict[str, str] = {}
+
+    def fetch_one(imo: str) -> tuple:
+        try:
+            with requests.Session() as session:
+                data = scrape_vf_full(imo, session)
+            if not data.get("found"):
+                return imo, None, "Vessel not found"
+            return imo, data, None
+        except Exception as e:
+            logger.error(f"Batch scrape failed for IMO {imo}: {e}")
+            return imo, None, str(e)
+
+    logger.info(f"Batch request: {len(imos)} vessels, {BATCH_MAX_WORKERS} workers")
+
+    with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_one, imo): imo for imo in imos}
+        for future in as_completed(futures):
+            imo, data, error = future.result()
+            if error:
+                errors[imo] = error
+            else:
+                results[imo] = data
+
+    logger.info(f"Batch complete: {len(results)} success, {len(errors)} errors")
+
+    return {
+        "results": results,
+        "errors":  errors,
+        "total":   len(imos),
+        "success": len(results),
+        "failed":  len(errors),
+    }

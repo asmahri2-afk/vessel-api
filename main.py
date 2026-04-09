@@ -629,20 +629,13 @@ async def sof_generate(data: SOFData, request: Request):
                     logo_resp.raise_for_status()
                     logo_bytes = logo_resp.content
 
-                from openpyxl.drawing.image import Image as XLImage
+                # Swap image data directly on existing image object
+                # This preserves anchor, size and all positioning
                 old_img = ws._images[0]
-                old_anchor = old_img.anchor
-
-                new_img = XLImage(io.BytesIO(logo_bytes))
-                new_img.anchor = old_anchor
-                # Match original size
-                new_img.width  = old_img.width
-                new_img.height = old_img.height
-
-                ws._images[0] = new_img
-                logger.info("Swapped logo to COMANAV")
+                old_img.ref = io.BytesIO(logo_bytes)
+                logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
             except Exception as e:
-                logger.warning(f"Logo swap failed (non-critical): {e}")
+                logger.warning(f"Logo swap failed (non-critical): {type(e).__name__}: {e}", exc_info=True)
 
         # Save to buffer
         buf = io.BytesIO()

@@ -3,14 +3,19 @@ import logging
 import os
 import re
 import requests
+import httpx
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import copy
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
-
+from openpyxl import load_workbook
+from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 # ============================================================
 # LOGGING
 # ============================================================
@@ -419,3 +424,242 @@ def vessel_batch(body: BatchRequest, request: Request):
         "success": len(results),
         "failed":  len(errors),
     }
+
+
+# ============================================================
+# SOF — STATEMENT OF FACTS GENERATOR
+# ============================================================
+
+
+DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+
+class SOFRow(BaseModel):
+    date:    Optional[str] = ''
+    wfrom:   Optional[str] = ''
+    wto:     Optional[str] = ''
+    sfrom:   Optional[str] = ''
+    sto:     Optional[str] = ''
+    cranes:  Optional[str] = ''
+    qty:     Optional[str] = ''
+    remarks: Optional[str] = ''
+
+class SOFData(BaseModel):
+    agent:             Optional[str] = ''
+    operation_type:    Optional[str] = 'import'  # 'import' = discharging, 'export' = loading
+    vessel:            Optional[str] = ''
+    port:              Optional[str] = ''
+    owners:            Optional[str] = ''
+    cargo:             Optional[str] = ''
+    bl_weight:         Optional[str] = ''
+    bl_number:         Optional[str] = ''
+    nor_accepted:      Optional[str] = 'AS PER TERMS AND CONDITIONS OF THE RELEVENT C/P.'
+    port_hours:        Optional[str] = ''
+    general_remarks:   Optional[str] = ''
+    remarks:           Optional[str] = ''
+    master_remarks:    Optional[str] = ''
+    berthed_date:      Optional[str] = ''
+    berthed_time:      Optional[str] = ''
+    disch_start_date:  Optional[str] = ''
+    disch_start_time:  Optional[str] = ''
+    disch_end_date:    Optional[str] = ''
+    disch_end_time:    Optional[str] = ''
+    cargo_docs_date:   Optional[str] = ''
+    cargo_docs_time:   Optional[str] = ''
+    sailing_date:      Optional[str] = ''
+    sailing_time:      Optional[str] = ''
+    eosp_date:         Optional[str] = ''
+    eosp_time:         Optional[str] = ''
+    nor_tender_date:   Optional[str] = ''
+    nor_tender_time:   Optional[str] = ''
+    anchor_drop_date:  Optional[str] = ''
+    anchor_drop_time:  Optional[str] = ''
+    anchor_weigh_date: Optional[str] = ''
+    anchor_weigh_time: Optional[str] = ''
+    pilot_date:        Optional[str] = ''
+    pilot_time:        Optional[str] = ''
+    rows:              List[SOFRow] = []
+
+def fmt_dt(date: str, time: str) -> str:
+    if not date:
+        return ''
+    try:
+        parts = date.split('-')
+        d = f"{parts[2]}/{parts[1]}/{parts[0]}" if len(parts) == 3 else date
+    except Exception:
+        d = date
+    t = time.replace(':', '') if time else ''
+    return f"{d} at   {t} hr" if t else d
+
+def get_day_name(date_str: str) -> str:
+    if not date_str:
+        return ''
+    try:
+        dt = datetime.strptime(date_str, '%Y-%m-%d')
+        return DAYS[dt.weekday()]
+    except Exception:
+        return ''
+
+SOF_TEMPLATE_BYTES: Optional[bytes] = None
+
+async def get_sof_template() -> bytes:
+    global SOF_TEMPLATE_BYTES
+    if SOF_TEMPLATE_BYTES:
+        return SOF_TEMPLATE_BYTES
+    # Fetch template from GitHub Pages
+    url = 'https://asmahri2-afk.github.io/test/SOF_TEMPLATE.xlsx'
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        SOF_TEMPLATE_BYTES = r.content
+        logger.info(f"SOF template loaded: {len(SOF_TEMPLATE_BYTES)} bytes")
+        return SOF_TEMPLATE_BYTES
+
+
+@app.post('/sof/generate')
+async def sof_generate(data: SOFData, request: Request):
+    # Auth check
+    if API_SECRET:
+        client_secret = request.headers.get('X-API-Secret', '')
+        if client_secret != API_SECRET:
+            raise HTTPException(status_code=401, detail='Unauthorized')
+
+    try:
+        template_bytes = await get_sof_template()
+        wb = load_workbook(io.BytesIO(template_bytes))
+        ws = wb.active
+
+        # Operation verb: import = discharging, export = loading
+        operation_verb = 'loading' if (data.operation_type or '').lower() == 'export' else 'discharging'
+
+        # Build tag → value map
+        tag_values = {
+            '{{AGENT}}':          data.agent or '',
+            '{{VESSEL_NAME}}':    data.vessel or '',
+            '{{PORT}}':           data.port or '',
+            '{{OWNERS}}':         data.owners or '',
+            '{{CARGO}}':          data.cargo or '',
+            '{{BL_WEIGHT}}':      data.bl_weight or '',
+            '{{BL_NUMBER}}':      data.bl_number or '',
+            '{{PORT_HOURS}}':     data.port_hours or '',
+            '{{GENERAL_REMARKS}}': data.general_remarks or '',
+            '{{REMARKS}}':        data.remarks or '',
+            '{{MASTER_REMARKS}}': data.master_remarks or '',
+            '{{NOR_ACCEPTED}}':   data.nor_accepted or '',
+            '{{OPERATION_VERB}}': operation_verb,
+            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':         fmt_dt(data.berthed_date, data.berthed_time),
+            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr': fmt_dt(data.disch_start_date, data.disch_start_time),
+            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':     fmt_dt(data.disch_end_date, data.disch_end_time),
+            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':   fmt_dt(data.cargo_docs_date, data.cargo_docs_time),
+            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':         fmt_dt(data.sailing_date, data.sailing_time),
+            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':               fmt_dt(data.eosp_date, data.eosp_time),
+            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':   fmt_dt(data.nor_tender_date, data.nor_tender_time),
+            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr': fmt_dt(data.anchor_drop_date, data.anchor_drop_time),
+            '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
+            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':             fmt_dt(data.pilot_date, data.pilot_time),
+            'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
+        }
+
+        # Replace all tags preserving cell styles
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value and isinstance(cell.value, str):
+                    val = cell.value
+                    for tag, replacement in tag_values.items():
+                        if tag in val:
+                            val = val.replace(tag, replacement)
+                    cell.value = val
+
+        # Handle dynamic ops rows
+        marker_row = template_row = end_row = None
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value == '{{#EACH_ROW}}':   marker_row = cell.row
+                elif cell.value == '{{ROW_DATE}}':   template_row = cell.row
+                elif cell.value == '{{/EACH_ROW}}':  end_row = cell.row
+
+        if marker_row and template_row and data.rows:
+            # Capture template row styles before clearing
+            tpl_styles = {}
+            for col in range(1, 12):
+                c = ws.cell(row=template_row, column=col)
+                tpl_styles[col] = {
+                    'font':      copy(c.font),
+                    'border':    copy(c.border),
+                    'fill':      copy(c.fill),
+                    'alignment': copy(c.alignment),
+                }
+
+            # Clear marker/template/end rows
+            for r in filter(None, [marker_row, template_row, end_row]):
+                for col in range(1, 12):
+                    ws.cell(row=r, column=col).value = None
+
+            # Write data rows
+            for i, row_data in enumerate(data.rows):
+                r = marker_row + i
+                values = [
+                    fmt_dt(row_data.date, '').split(' ')[0] if row_data.date else '',
+                    get_day_name(row_data.date),
+                    row_data.wfrom.replace(':','') if row_data.wfrom else '',
+                    row_data.wto.replace(':','') if row_data.wto else '',
+                    row_data.sfrom.replace(':','') if row_data.sfrom else '',
+                    row_data.sto.replace(':','') if row_data.sto else '',
+                    row_data.cranes or '',
+                    row_data.qty or '',
+                    '',
+                    row_data.remarks or '',
+                    '',
+                ]
+                for col, val in enumerate(values, 1):
+                    cell = ws.cell(row=r, column=col)
+                    cell.value = val if val else None
+                    s = tpl_styles.get(col, {})
+                    if s.get('font'):      cell.font = s['font']
+                    if s.get('border'):    cell.border = s['border']
+                    if s.get('fill'):      cell.fill = s['fill']
+                    if s.get('alignment'): cell.alignment = s['alignment']
+
+        # ── Logo swap ─────────────────────────────────────────────────────────
+        # If agent is COMANAV, replace CMA CGM logo with COMANAV logo
+        if (data.agent or '').upper() == 'COMANAV' and ws._images:
+            try:
+                comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
+                async with httpx.AsyncClient(timeout=10) as client:
+                    logo_resp = await client.get(comanav_url)
+                    logo_resp.raise_for_status()
+                    logo_bytes = logo_resp.content
+
+                from openpyxl.drawing.image import Image as XLImage
+                old_img = ws._images[0]
+                old_anchor = old_img.anchor
+
+                new_img = XLImage(io.BytesIO(logo_bytes))
+                new_img.anchor = old_anchor
+                # Match original size
+                new_img.width  = old_img.width
+                new_img.height = old_img.height
+
+                ws._images[0] = new_img
+                logger.info("Swapped logo to COMANAV")
+            except Exception as e:
+                logger.warning(f"Logo swap failed (non-critical): {e}")
+
+        # Save to buffer
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        vessel = (data.vessel or 'VESSEL').replace(' ', '_')
+        port = (data.port or 'PORT').replace(' ', '_')
+        date_str = datetime.now().strftime('%Y%m%d')
+        filename = f"SOF_{vessel}_{port}_{date_str}.xlsx"
+
+        return Response(
+            content=buf.read(),
+            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+        )
+
+    except Exception as e:
+        logger.error(f"SOF generation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"SOF generation failed: {str(e)}")

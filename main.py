@@ -1,658 +1,1259 @@
-import json
-import logging
-import os
-import re
-import requests
-import httpx
-import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from copy import copy
-from datetime import datetime, timezone
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
-from openpyxl import load_workbook
-from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
-# ============================================================
-# LOGGING
-# ============================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// Cloudflare Worker: Vessel Manager
+// Handles all reads + add/remove vessels + triggers GitHub workflow
+// ═══════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+// ── In-memory rate limiter for auth endpoints ────────────────────────────────
+// Limits per IP: 10 requests per 15 minutes on auth routes.
+// Uses a Map that auto-clears old entries to avoid memory growth.
+const _rateLimitMap = new Map(); // key: `${ip}:${route}` → { count, resetAt }
+const RATE_LIMIT_MAX      = 10;
+const RATE_LIMIT_WINDOW   = 15 * 60 * 1000; // 15 minutes
 
-# ============================================================
-# HTTP CONFIG
-# ============================================================
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.vesselfinder.com/",
+function checkRateLimit(ip, route) {
+    const key = `${ip}:${route}`;
+    const now = Date.now();
+    const entry = _rateLimitMap.get(key);
+    if (!entry || now > entry.resetAt) {
+        _rateLimitMap.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+        return false; // not limited
+    }
+    if (entry.count >= RATE_LIMIT_MAX) return true; // limited
+    entry.count++;
+    return false;
 }
 
-MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
+export default {
+  async fetch(request, env) {
+    // CORS headers
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    };
 
-API_SECRET  = os.getenv("API_SECRET", "")
-
-# Max parallel workers for batch — keep low to avoid hammering VesselFinder
-BATCH_MAX_WORKERS = 4
-BATCH_MAX_IMOS    = 50  # safety cap per batch request
-
-# ============================================================
-# FASTAPI APP + CORS
-# ============================================================
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
-
-class BatchRequest(BaseModel):
-    imos: List[str]
-
-# ============================================================
-# UTILITY HELPERS
-# ============================================================
-
-def count_decimals(val: Any) -> int:
-    if val is None:
-        return 0
-    s = str(val)
-    if "." in s:
-        return len(s.split(".")[-1].rstrip("0"))
-    return 0
-
-def parse_vf_timestamp(ts: Optional[str]) -> Optional[datetime]:
-    if not ts:
-        return None
-    ts = ts.replace(" UTC", "").strip()
-    for fmt in ("%b %d, %Y %H:%M", "%B %d, %Y %H:%M"):
-        try:
-            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
-        except ValueError:
-            continue
-    logger.warning(f"Could not parse VF timestamp: '{ts}'")
-    return None
-
-def get_vf_age_minutes(last_pos_utc: Optional[str]) -> int:
-    dt = parse_vf_timestamp(last_pos_utc)
-    if not dt:
-        return 999
-    age = (datetime.now(timezone.utc) - dt).total_seconds() / 60
-    return int(age)
-
-# ============================================================
-# INPUT VALIDATION
-# ============================================================
-
-def validate_imo(imo: str) -> bool:
-    imo = str(imo).strip()
-    if not re.match(r'^\d{7}$', imo):
-        return False
-    try:
-        total = sum(int(imo[i]) * (7 - i) for i in range(6))
-        return int(imo[6]) == total % 10
-    except Exception:
-        return False
-
-# ============================================================
-# HTML HELPERS – VESSELFINDER
-# ============================================================
-
-def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
-    data: Dict[str, str] = {}
-    tables = soup.find_all(class_=table_class)
-    if not tables:
-        return data
-
-    for table in tables:
-        for row in table.find_all("tr"):
-            label_el = row.find(
-                class_=lambda x: x and ("tpc1" in x or "tpx1" in x or "n3" in x)
-            )
-            value_el = row.find(
-                class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x)
-            )
-            if not (label_el and value_el):
-                continue
-            label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
-            label = " ".join(label_parts).replace(":", "").strip()
-            value = value_el.get_text(strip=True)
-            if label:
-                data[label] = value
-    return data
-
-def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[str]:
-    for s in soup.find_all("script"):
-        if not s.string:
-            continue
-        m = re.search(r"MMSI\s*=\s*(\d+)", s.string)
-        if m:
-            return m.group(1)
-    if "MMSI" in static_data:
-        v = static_data["MMSI"].strip()
-        if v:
-            return v
-    for key, value in static_data.items():
-        if "MMSI" in key.upper():
-            v = value.strip()
-            if v:
-                return v
-    return None
-
-# ============================================================
-# MYSHIPTRACKING HELPER
-# ============================================================
-
-def get_myshiptracking_pos(
-    mmsi: str,
-    center_lat: Optional[float],
-    center_lon: Optional[float],
-    session: requests.Session,
-    pad: float = 0.9,
-) -> Optional[Dict[str, Any]]:
-    if center_lat is None or center_lon is None:
-        return None
-
-    try:
-        lat_f, lon_f = float(center_lat), float(center_lon)
-    except (TypeError, ValueError):
-        return None
-
-    current_year = datetime.now().year
-
-    params = {
-        "type": "json",
-        "minlat": lat_f - pad, "maxlat": lat_f + pad,
-        "minlon": lon_f - pad, "maxlon": lon_f + pad,
-        "zoom": 15, "selid": -1, "seltype": 0, "timecode": -1,
-        "filters": json.dumps({
-            "vtypes": ",0,3,4,6,7,8,9,10,11,12,13", "ports": "1",
-            "minsog": 0, "maxsog": 60, "minsz": 0, "maxsz": 500,
-            "minyr": 1950, "maxyr": current_year, "status": "",
-            "mapflt_from": "", "mapflt_dest": "",
-        }),
+    // Handle preflight requests
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
     }
 
-    mst_headers = dict(HEADERS)
-    mst_headers["Referer"] = "https://www.myshiptracking.com/"
+    const url = new URL(request.url);
+    const path = url.pathname;
 
-    try:
-        r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
-        if r.status_code != 200:
-            logger.warning(f"MyShipTracking returned status {r.status_code} for MMSI {mmsi}")
-            return None
-
-        lines = [l.strip() for l in r.text.splitlines() if l.strip()]
-        if len(lines) < 3:
-            return None
-
-        target_mmsi = str(mmsi).strip()
-        for line in lines[2:]:
-            parts = line.split("\t") if "\t" in line else line.split()
-            if len(parts) >= 7 and parts[2].strip() == target_mmsi:
-                return {
-                    "lat": float(parts[4]),
-                    "lon": float(parts[5]),
-                    "sog": float(parts[6]) if parts[6] != "" else None,
-                    "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
-                }
-
-    except Exception as e:
-        logger.warning(f"MyShipTracking fetch failed for MMSI {mmsi}: {e}")
-
-    return None
-
-# ============================================================
-# MAIN SCRAPER
-# ============================================================
-
-def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
-    url = f"https://www.vesselfinder.com/vessels/details/{imo}"
-
-    r = session.get(url, headers=HEADERS, timeout=20)
-
-    if r.status_code == 404:
-        logger.info(f"IMO {imo} returned 404 from VesselFinder")
-        return {"found": False, "imo": imo}
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    name_el = soup.select_one("h1.title")
-    name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
-    dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
-    destination = dest_el.get_text(strip=True) if dest_el else ""
-
-    info_icon = soup.select_one("svg.ttt1.info")
-    last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
-    logger.info(f"IMO {imo} | name={name} | last_pos_utc={last_pos_utc}")
-
-    tech_data      = extract_table_data(soup, "tpt1")
-    dims_data      = extract_table_data(soup, "tptfix")
-    ais_table_data = extract_table_data(soup, "vessel-info-table")
-    aparams_data   = extract_table_data(soup, "aparams")
-    static_data    = {**tech_data, **dims_data, **ais_table_data, **aparams_data}
-    mmsi           = extract_mmsi(soup, static_data)
-
-    draught_val = static_data.get("Current draught") or static_data.get("Draught")
-    if not draught_val:
-        match = re.search(r"(?:draught|draft)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", soup.get_text(), re.IGNORECASE)
-        if match:
-            draught_val = f"{match.group(1)} m"
-
-    final_static_data = {
-        "imo": imo,
-        "vessel_name": name,
-        "ship_type": static_data.get("Ship Type") or static_data.get("Ship type") or static_data.get("Type") or "",
-        "flag": (soup.select_one("div.title-flag-icon").get("title") if soup.select_one("div.title-flag-icon") else None),
-        "mmsi": mmsi,
-        "draught_m": draught_val or "",
-        "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
-        "gross_tonnage": static_data.get("Gross Tonnage"),
-        "year_of_build": static_data.get("Year of Build"),
-        "length_overall_m": static_data.get("Length Overall"),
-        "beam_m": static_data.get("Beam"),
+    // Apply rate limiting to all auth endpoints
+    const authPaths = ['/auth/login', '/auth/register', '/auth/delete'];
+    if (authPaths.includes(path)) {
+      const ip = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For') || 'unknown';
+      if (checkRateLimit(ip, path)) {
+        return jsonResponse({ error: 'Too many requests — try again in 15 minutes' }, 429, corsHeaders);
+      }
     }
 
-    vf_lat = vf_lon = sog = cog = None
-    djson_div = soup.find("div", id="djson")
-    if djson_div and djson_div.has_attr("data-json"):
-        try:
-            ais = json.loads(djson_div["data-json"])
-            vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
-            vf_lon = float(ais.get("ship_lon")) if ais.get("ship_lon") else None
-            sog = ais.get("ship_sog")
-            cog = ais.get("ship_cog")
-            logger.info(f"IMO {imo} | VF AIS: lat={vf_lat}, lon={vf_lon}, sog={sog}, cog={cog}")
-        except Exception as e:
-            logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
+    try {
 
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session) if (mmsi and vf_lat) else None
-
-    use_mst = False
-    vf_age  = get_vf_age_minutes(last_pos_utc)
-    MAX_VF_AGE = 60
-
-    if mst_data:
-        vf_precision  = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
-        mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-
-        if vf_lat is None:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF has no position")
-        elif vf_age > MAX_VF_AGE:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF data is {vf_age} min old (>{MAX_VF_AGE})")
-        elif mst_precision > vf_precision:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: higher precision ({mst_precision} vs {vf_precision})")
-        else:
-            use_mst = False
-            logger.info(f"IMO {imo} | Using VF: fresher or equal precision (age={vf_age} min)")
-
-    if use_mst and mst_data:
-        lat, lon = mst_data["lat"], mst_data["lon"]
-        sog = mst_data.get("sog", sog)
-        cog = mst_data.get("cog", cog)
-        ais_source = "myshiptracking"
-    else:
-        lat, lon = vf_lat, vf_lon
-        ais_source = "vesselfinder"
-
-    logger.info(f"IMO {imo} | Final: lat={lat}, lon={lon}, sog={sog}, source={ais_source}")
-
-    return {
-        "found": True,
-        "destination": destination,
-        "last_pos_utc": last_pos_utc,
-        **final_static_data,
-        "lat": lat, "lon": lon, "sog": sog, "cog": cog,
-        "ais_source": ais_source,
-    }
-
-# ============================================================
-# API ENDPOINTS
-# ============================================================
-
-def _check_auth(request: Request, imo: str = ""):
-    """Shared auth check for all endpoints."""
-    if API_SECRET:
-        client_secret = request.headers.get("X-API-Secret", "")
-        if client_secret != API_SECRET:
-            logger.warning(f"Unauthorized request for IMO {imo} from {request.client.host}")
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
-
-@app.get("/ping")
-def ping():
-    return {"ok": True}
-
-
-@app.get("/vessel-full/{imo}")
-def vessel_full(imo: str, request: Request):
-    _check_auth(request, imo)
-
-    if not validate_imo(imo):
-        logger.warning(f"Invalid IMO rejected: {imo}")
-        raise HTTPException(status_code=400, detail="Invalid IMO number")
-
-    with requests.Session() as session:
-        try:
-            data = scrape_vf_full(imo, session)
-        except Exception as e:
-            logger.error(f"Scrape failed for IMO {imo}: {e}", exc_info=True)
-            raise HTTPException(status_code=502, detail="Upstream scrape failed")
-
-    if not data.get("found"):
-        raise HTTPException(status_code=404, detail="Vessel not found")
-
-    return data
-
-
-@app.post("/vessel-batch")
-def vessel_batch(body: BatchRequest, request: Request):
-    """
-    Fetch multiple vessels in parallel.
-    POST /vessel-batch
-    Body: {"imos": ["9427079", "9437854", ...]}
-    Returns: {"results": {"9427079": {...}, "9437854": {...}}, "errors": {"bad_imo": "reason"}}
-    """
-    _check_auth(request)
-
-    # Validate and deduplicate
-    imos = list(dict.fromkeys(body.imos))  # preserve order, remove duplicates
-
-    if len(imos) > BATCH_MAX_IMOS:
-        raise HTTPException(status_code=400, detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch")
-
-    invalid = [imo for imo in imos if not validate_imo(imo)]
-    if invalid:
-        raise HTTPException(status_code=400, detail=f"Invalid IMOs: {', '.join(invalid)}")
-
-    results: Dict[str, Any] = {}
-    errors:  Dict[str, str] = {}
-
-    def fetch_one(imo: str) -> tuple:
-        try:
-            with requests.Session() as session:
-                data = scrape_vf_full(imo, session)
-            if not data.get("found"):
-                return imo, None, "Vessel not found"
-            return imo, data, None
-        except Exception as e:
-            logger.error(f"Batch scrape failed for IMO {imo}: {e}")
-            return imo, None, str(e)
-
-    logger.info(f"Batch request: {len(imos)} vessels, {BATCH_MAX_WORKERS} workers")
-
-    with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_one, imo): imo for imo in imos}
-        for future in as_completed(futures):
-            imo, data, error = future.result()
-            if error:
-                errors[imo] = error
-            else:
-                results[imo] = data
-
-    logger.info(f"Batch complete: {len(results)} success, {len(errors)} errors")
-
-    return {
-        "results": results,
-        "errors":  errors,
-        "total":   len(imos),
-        "success": len(results),
-        "failed":  len(errors),
-    }
-
-
-# ============================================================
-# SOF — STATEMENT OF FACTS GENERATOR
-# ============================================================
-
-
-DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
-
-class SOFRow(BaseModel):
-    date:    Optional[str] = ''
-    wfrom:   Optional[str] = ''
-    wto:     Optional[str] = ''
-    sfrom:   Optional[str] = ''
-    sto:     Optional[str] = ''
-    cranes:  Optional[str] = ''
-    qty:     Optional[str] = ''
-    remarks: Optional[str] = ''
-
-class SOFData(BaseModel):
-    agent:             Optional[str] = ''
-    operation_type:    Optional[str] = 'import'  # 'import' = discharging, 'export' = loading
-    vessel:            Optional[str] = ''
-    port:              Optional[str] = ''
-    owners:            Optional[str] = ''
-    cargo:             Optional[str] = ''
-    bl_weight:         Optional[str] = ''
-    bl_number:         Optional[str] = ''
-    nor_accepted:      Optional[str] = 'AS PER TERMS AND CONDITIONS OF THE RELEVENT C/P.'
-    port_hours:        Optional[str] = ''
-    general_remarks:   Optional[str] = ''
-    remarks:           Optional[str] = ''
-    master_remarks:    Optional[str] = ''
-    berthed_date:      Optional[str] = ''
-    berthed_time:      Optional[str] = ''
-    disch_start_date:  Optional[str] = ''
-    disch_start_time:  Optional[str] = ''
-    disch_end_date:    Optional[str] = ''
-    disch_end_time:    Optional[str] = ''
-    cargo_docs_date:   Optional[str] = ''
-    cargo_docs_time:   Optional[str] = ''
-    sailing_date:      Optional[str] = ''
-    sailing_time:      Optional[str] = ''
-    eosp_date:         Optional[str] = ''
-    eosp_time:         Optional[str] = ''
-    nor_tender_date:   Optional[str] = ''
-    nor_tender_time:   Optional[str] = ''
-    anchor_drop_date:  Optional[str] = ''
-    anchor_drop_time:  Optional[str] = ''
-    anchor_weigh_date: Optional[str] = ''
-    anchor_weigh_time: Optional[str] = ''
-    pilot_date:        Optional[str] = ''
-    pilot_time:        Optional[str] = ''
-    rows:              List[SOFRow] = []
-
-def fmt_dt(date: str, time: str) -> str:
-    if not date:
-        return ''
-    try:
-        parts = date.split('-')
-        d = f"{parts[2]}/{parts[1]}/{parts[0]}" if len(parts) == 3 else date
-    except Exception:
-        d = date
-    t = time.replace(':', '') if time else ''
-    return f"{d} at   {t} hr" if t else d
-
-def get_day_name(date_str: str) -> str:
-    if not date_str:
-        return ''
-    try:
-        dt = datetime.strptime(date_str, '%Y-%m-%d')
-        return DAYS[dt.weekday()]
-    except Exception:
-        return ''
-
-SOF_TEMPLATE_BYTES: Optional[bytes] = None
-
-async def get_sof_template() -> bytes:
-    global SOF_TEMPLATE_BYTES
-    if SOF_TEMPLATE_BYTES:
-        return SOF_TEMPLATE_BYTES
-    # Fetch template from GitHub Pages
-    url = 'https://asmahri2-afk.github.io/test/SOF_TEMPLATE.xlsx'
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(url)
-        r.raise_for_status()
-        SOF_TEMPLATE_BYTES = r.content
-        logger.info(f"SOF template loaded: {len(SOF_TEMPLATE_BYTES)} bytes")
-        return SOF_TEMPLATE_BYTES
-
-
-@app.post('/sof/generate')
-async def sof_generate(data: SOFData, request: Request):
-    # Auth check
-    if API_SECRET:
-        client_secret = request.headers.get('X-API-Secret', '')
-        if client_secret != API_SECRET:
-            raise HTTPException(status_code=401, detail='Unauthorized')
-
-    try:
-        template_bytes = await get_sof_template()
-        wb = load_workbook(io.BytesIO(template_bytes))
-        ws = wb.active
-
-        # Operation verb: import = discharging, export = loading
-        operation_verb = 'loading' if (data.operation_type or '').lower() == 'export' else 'discharging'
-
-        # Build tag → value map
-        tag_values = {
-            '{{AGENT}}':          data.agent or '',
-            '{{VESSEL_NAME}}':    data.vessel or '',
-            '{{PORT}}':           data.port or '',
-            '{{OWNERS}}':         data.owners or '',
-            '{{CARGO}}':          data.cargo or '',
-            '{{BL_WEIGHT}}':      data.bl_weight or '',
-            '{{BL_NUMBER}}':      data.bl_number or '',
-            '{{PORT_HOURS}}':     data.port_hours or '',
-            '{{GENERAL_REMARKS}}': data.general_remarks or '',
-            '{{REMARKS}}':        data.remarks or '',
-            '{{MASTER_REMARKS}}': data.master_remarks or '',
-            '{{NOR_ACCEPTED}}':   data.nor_accepted or '',
-            '{{OPERATION_VERB}}': operation_verb,
-            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':         fmt_dt(data.berthed_date, data.berthed_time),
-            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr': fmt_dt(data.disch_start_date, data.disch_start_time),
-            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':     fmt_dt(data.disch_end_date, data.disch_end_time),
-            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':   fmt_dt(data.cargo_docs_date, data.cargo_docs_time),
-            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':         fmt_dt(data.sailing_date, data.sailing_time),
-            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':               fmt_dt(data.eosp_date, data.eosp_time),
-            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':   fmt_dt(data.nor_tender_date, data.nor_tender_time),
-            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr': fmt_dt(data.anchor_drop_date, data.anchor_drop_time),
-            '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
-            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':             fmt_dt(data.pilot_date, data.pilot_time),
-            'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Load all data
+      // Accepts optional Authorization: Bearer <user_token> header.
+      // With token → returns that user's personal fleet.
+      // Without    → returns public fleet (user_id IS NULL).
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/data/load' && request.method === 'GET') {
+        // Resolve user from token if present
+        let userId = null;
+        const authHeader = request.headers.get('Authorization');
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+          const token = authHeader.slice(7);
+          try {
+            const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+              headers: {
+                'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+                'Authorization': `Bearer ${token}`,
+              },
+            });
+            if (userRes.ok) {
+              const user = await userRes.json();
+              userId = user.id || null;
+            }
+          } catch (_) {}
         }
 
-        # Replace all tags preserving cell styles
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value and isinstance(cell.value, str):
-                    val = cell.value
-                    for tag, replacement in tag_values.items():
-                        if tag in val:
-                            val = val.replace(tag, replacement)
-                    cell.value = val
+        const imoQuery = userId
+          ? `select=imo&user_id=eq.${userId}`
+          : 'select=imo&user_id=is.null';
 
-        # Handle dynamic ops rows
-        marker_row = template_row = end_row = None
-        for row in ws.iter_rows():
-            for cell in row:
-                if cell.value == '{{#EACH_ROW}}':   marker_row = cell.row
-                elif cell.value == '{{ROW_DATE}}':   template_row = cell.row
-                elif cell.value == '{{/EACH_ROW}}':  end_row = cell.row
+        const [trackedRows, allVessels, cache, ports] = await Promise.all([
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, 'tracked_imos', imoQuery, 'GET'),
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, 'vessels', 'select=*', 'GET'),
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, 'static_vessel_cache', 'select=*', 'GET'),
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY, 'ports', 'select=name,lat,lon,anchorage_depth,cargo_pier_depth', 'GET'),
+        ]);
 
-        if marker_row and template_row and data.rows:
-            # Capture template row styles before clearing
-            tpl_styles = {}
-            for col in range(1, 12):
-                c = ws.cell(row=template_row, column=col)
-                tpl_styles[col] = {
-                    'font':      copy(c.font),
-                    'border':    copy(c.border),
-                    'fill':      copy(c.fill),
-                    'alignment': copy(c.alignment),
-                }
+        // Filter vessels to only those being tracked (avoids sending full table to browser)
+        const trackedImos = new Set(trackedRows.map(r => String(r.imo)));
+        const vessels = allVessels.filter(v => trackedImos.has(String(v.imo)));
 
-            # Clear marker/template/end rows
-            for r in filter(None, [marker_row, template_row, end_row]):
-                for col in range(1, 12):
-                    ws.cell(row=r, column=col).value = None
+        return jsonResponse({ tracked: trackedRows, vessels, cache, ports }, 200, corsHeaders);
+      }
 
-            # Write data rows
-            for i, row_data in enumerate(data.rows):
-                r = marker_row + i
-                values = [
-                    fmt_dt(row_data.date, '').split(' ')[0] if row_data.date else '',
-                    get_day_name(row_data.date),
-                    row_data.wfrom.replace(':','') if row_data.wfrom else '',
-                    row_data.wto.replace(':','') if row_data.wto else '',
-                    row_data.sfrom.replace(':','') if row_data.sfrom else '',
-                    row_data.sto.replace(':','') if row_data.sto else '',
-                    row_data.cranes or '',
-                    row_data.qty or '',
-                    '',
-                    row_data.remarks or '',
-                    '',
-                ]
-                for col, val in enumerate(values, 1):
-                    cell = ws.cell(row=r, column=col)
-                    cell.value = val if val else None
-                    s = tpl_styles.get(col, {})
-                    if s.get('font'):      cell.font = s['font']
-                    if s.get('border'):    cell.border = s['border']
-                    if s.get('fill'):      cell.fill = s['fill']
-                    if s.get('alignment'): cell.alignment = s['alignment']
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Load sanctions list (replaces sbFetch in loadSanctionsLists())
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/data/sanctions' && request.method === 'GET') {
+        const data = await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'sanctioned_imos',
+          'select=imo,name,lists,program&limit=10000',
+          'GET'
+        );
 
-        # ── Logo swap ─────────────────────────────────────────────────────────
-        # If agent is COMANAV, replace CMA CGM logo with COMANAV logo
-        if (data.agent or '').upper() == 'COMANAV' and ws._images:
-            try:
-                comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
-                async with httpx.AsyncClient(timeout=10) as client:
-                    logo_resp = await client.get(comanav_url)
-                    logo_resp.raise_for_status()
-                    logo_bytes = logo_resp.content
+        return jsonResponse(data, 200, corsHeaders);
+      }
 
-                # Swap image data directly on existing image object
-                # This preserves anchor, size and all positioning
-                old_img = ws._images[0]
-                old_img.ref = io.BytesIO(logo_bytes)
-                logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
-            except Exception as e:
-                logger.warning(f"Logo swap failed (non-critical): {type(e).__name__}: {e}", exc_info=True)
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Register new user
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/auth/register' && request.method === 'POST') {
+        const body = await request.json();
+        const { username, pin } = body;
 
-        # Save to buffer
-        buf = io.BytesIO()
-        wb.save(buf)
-        buf.seek(0)
+        if (!username || username.length < 3 || !/^[a-zA-Z0-9_]+$/.test(username)) {
+          return jsonResponse({ error: 'Invalid username (min 3 chars, alphanumeric/underscore)' }, 400, corsHeaders);
+        }
+        if (!pin || !/^\d{4,6}$/.test(String(pin))) {
+          return jsonResponse({ error: 'Invalid PIN (4-6 digits)' }, 400, corsHeaders);
+        }
 
-        vessel = (data.vessel or 'VESSEL').replace(' ', '_')
-        port = (data.port or 'PORT').replace(' ', '_')
-        date_str = datetime.now().strftime('%Y%m%d')
-        filename = f"SOF_{vessel}_{port}_{date_str}.xlsx"
+        // Check if username already taken
+        const existing = await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles',
+          `username=eq.${encodeURIComponent(username)}&select=id`,
+          'GET'
+        );
 
-        return Response(
-            content=buf.read(),
-            media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
-        )
+        if (existing.length > 0) {
+          return jsonResponse({ error: 'Username already taken' }, 400, corsHeaders);
+        }
 
-    except Exception as e:
-        logger.error(f"SOF generation failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"SOF generation failed: {str(e)}")
+        // Create Supabase auth user via admin API
+        const email = `${username.toLowerCase()}@vt.local`;
+        const createUserRes = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users`, {
+          method: 'POST',
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            email,
+            password: String(pin),
+            email_confirm: true,
+            email_confirmed_at: new Date().toISOString(), // required by newer Supabase versions
+          }),
+        });
+
+        if (!createUserRes.ok) {
+          const errText = await createUserRes.text();
+          throw new Error(`Auth user creation failed: ${errText}`);
+        }
+
+        const userData = await createUserRes.json();
+        const userId = userData.id;
+
+        // Create user_profiles row
+        await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles',
+          null,
+          'POST',
+          { id: userId, username }
+        );
+
+        return jsonResponse({ success: true, user_id: userId }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Login
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/auth/login' && request.method === 'POST') {
+        const body = await request.json();
+        const { username, pin } = body;
+
+        if (!username || !pin) {
+          return jsonResponse({ error: 'Username and PIN required' }, 400, corsHeaders);
+        }
+
+        const email = `${username.toLowerCase()}@vt.local`;
+
+        const tokenRes = await fetch(`${env.SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+          method: 'POST',
+          headers: {
+            // grant_type=password requires the anon/publishable key, not service role key
+            'apikey': env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_ROLE_KEY,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ email, password: String(pin) }),
+        });
+
+        if (!tokenRes.ok) {
+          const errBody = await tokenRes.json().catch(() => ({}));
+          const reason = errBody.error_description || errBody.msg || errBody.error || 'Invalid username or PIN';
+          return jsonResponse({ error: reason }, 401, corsHeaders);
+        }
+
+        const tokenData = await tokenRes.json();
+
+        return jsonResponse({
+          success: true,
+          access_token: tokenData.access_token,
+          user_id: tokenData.user?.id,
+          username,
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Delete Account
+      // Removes: tracked_imos (user), user_profiles row, Supabase auth user
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/auth/delete' && request.method === 'POST') {
+        const body = await request.json();
+        const { user_token, pin } = body;
+
+        if (!user_token) {
+          return jsonResponse({ error: 'user_token required' }, 400, corsHeaders);
+        }
+
+        // Validate token and get user
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${user_token}`,
+          },
+        });
+
+        if (!userRes.ok) {
+          return jsonResponse({ error: 'Invalid or expired token' }, 401, corsHeaders);
+        }
+
+        const user = await userRes.json();
+        const userId = user.id;
+        const email = user.email;
+
+        // Re-verify PIN before deletion — re-authenticate with password
+        if (pin) {
+          const verifyRes = await fetch(`${env.SUPABASE_URL}/auth/v1/token?grant_type=password`, {
+            method: 'POST',
+            headers: {
+              'apikey': env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_ROLE_KEY,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ email, password: String(pin) }),
+          });
+          if (!verifyRes.ok) {
+            return jsonResponse({ error: 'Incorrect PIN — account not deleted' }, 401, corsHeaders);
+          }
+        }
+
+        // 1. Delete all tracked IMOs for this user
+        await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos',
+          `user_id=eq.${userId}`,
+          'DELETE'
+        );
+
+        // 2. Delete user_profiles row
+        await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles',
+          `id=eq.${userId}`,
+          'DELETE'
+        );
+
+        // 3. Delete Supabase Auth user (admin API)
+        const deleteRes = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users/${userId}`, {
+          method: 'DELETE',
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+          },
+        });
+
+        if (!deleteRes.ok) {
+          const errText = await deleteRes.text();
+          throw new Error(`Auth user deletion failed: ${errText}`);
+        }
+
+        return jsonResponse({ success: true, message: 'Account deleted successfully' }, 200, corsHeaders);
+      }
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/user/settings' && request.method === 'POST') {
+        const body = await request.json();
+        const { user_token, callmebot_phone, callmebot_apikey, callmebot_enabled } = body;
+
+        if (!user_token) {
+          return jsonResponse({ error: 'user_token required' }, 400, corsHeaders);
+        }
+
+        // Validate JWT by calling Supabase /auth/v1/user
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${user_token}`,
+          },
+        });
+
+        if (!userRes.ok) {
+          return jsonResponse({ error: 'Invalid or expired token' }, 401, corsHeaders);
+        }
+
+        const user = await userRes.json();
+        const userId = user.id;
+
+        // Update user_profiles
+        await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles',
+          `id=eq.${userId}`,
+          'PATCH',
+          {
+            callmebot_phone: callmebot_phone || null,
+            callmebot_apikey: callmebot_apikey || null,
+            callmebot_enabled: !!callmebot_enabled,
+          }
+        );
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Admin dashboard data — only accessible by username 'asmahri'
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/admin/data' && request.method === 'GET') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+        const token = authHeader.slice(7);
+
+        // Validate token
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${token}`,
+          },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const authUser = await userRes.json();
+
+        // Check username is asmahri — anyone else gets 403
+        const profileCheck = await supabaseFetch(
+          env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles', `id=eq.${authUser.id}&select=username`, 'GET'
+        );
+        if (!profileCheck.length || profileCheck[0].username !== 'asmahri') {
+          return jsonResponse({ error: 'Forbidden' }, 403, corsHeaders);
+        }
+
+        // Fetch all data in parallel
+        const [users, trackedImos, vessels] = await Promise.all([
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'user_profiles', 'select=id,username,callmebot_enabled,callmebot_phone,callmebot_apikey', 'GET'),
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'tracked_imos', 'select=imo,user_id', 'GET'),
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'vessels', 'select=imo,name,sog,destination,last_alert_utc,nearest_port,nearest_distance_nm,eta_text,updated_at', 'GET'),
+        ]);
+
+        // Build vessel lookup map
+        const vesselMap = {};
+        vessels.forEach(v => { vesselMap[String(v.imo)] = v; });
+
+        // Build per-user fleet map
+        const userFleets = {};
+        trackedImos.forEach(row => {
+          const uid = row.user_id || '__public__';
+          if (!userFleets[uid]) userFleets[uid] = [];
+          userFleets[uid].push(String(row.imo));
+        });
+
+        // Enrich users with their vessel data
+        const enrichedUsers = users.map(u => ({
+          id: u.id,
+          username: u.username,
+          callmebot_enabled: u.callmebot_enabled,
+          callmebot_phone: u.callmebot_phone || '',
+          callmebot_apikey: u.callmebot_apikey || '',
+          vessels: (userFleets[u.id] || []).map(imo => ({
+            imo,
+            ...(vesselMap[imo] || { name: `IMO ${imo}` })
+          }))
+        }));
+
+        // Public fleet (user_id IS NULL)
+        const publicFleet = (userFleets['__public__'] || []).map(imo => ({
+          imo,
+          ...(vesselMap[imo] || { name: `IMO ${imo}` })
+        }));
+
+        return jsonResponse({
+          users: enrichedUsers,
+          public_fleet: publicFleet,
+          total_users: enrichedUsers.length,
+          total_vessels: vessels.length,
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Admin — Update user CallMeBot settings
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/admin/user/update' && request.method === 'POST') {
+        const body = await request.json();
+        const { admin_token, user_id, callmebot_phone, callmebot_apikey, callmebot_enabled } = body;
+
+        if (!admin_token || !user_id) return jsonResponse({ error: 'admin_token and user_id required' }, 400, corsHeaders);
+
+        // Verify admin
+        const adminCheck = await verifyAdmin(env, admin_token);
+        if (!adminCheck.ok) return jsonResponse({ error: adminCheck.error }, adminCheck.status, corsHeaders);
+
+        await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles', `id=eq.${user_id}`, 'PATCH',
+          {
+            callmebot_phone: callmebot_phone || null,
+            callmebot_apikey: callmebot_apikey || null,
+            callmebot_enabled: !!callmebot_enabled,
+          }
+        );
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Admin — Reset user PIN
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/admin/user/pin' && request.method === 'POST') {
+        const body = await request.json();
+        const { admin_token, user_id, new_pin } = body;
+
+        if (!admin_token || !user_id || !new_pin) return jsonResponse({ error: 'admin_token, user_id and new_pin required' }, 400, corsHeaders);
+        if (!/^\d{4,6}$/.test(String(new_pin))) return jsonResponse({ error: 'PIN must be 4-6 digits' }, 400, corsHeaders);
+
+        // Verify admin
+        const adminCheck = await verifyAdmin(env, admin_token);
+        if (!adminCheck.ok) return jsonResponse({ error: adminCheck.error }, adminCheck.status, corsHeaders);
+
+        const res = await fetch(`${env.SUPABASE_URL}/auth/v1/admin/users/${user_id}`, {
+          method: 'PUT',
+          headers: {
+            'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+            'Authorization': `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ password: String(new_pin) }),
+        });
+
+        if (!res.ok) {
+          const err = await res.text();
+          throw new Error(`PIN reset failed: ${err}`);
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Admin — Add vessel to user's fleet
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/admin/fleet/add' && request.method === 'POST') {
+        const body = await request.json();
+        const { admin_token, user_id, imo } = body;
+
+        if (!admin_token || !user_id || !imo) return jsonResponse({ error: 'admin_token, user_id and imo required' }, 400, corsHeaders);
+
+        const adminCheck = await verifyAdmin(env, admin_token);
+        if (!adminCheck.ok) return jsonResponse({ error: adminCheck.error }, adminCheck.status, corsHeaders);
+
+        const cleanImo = String(imo).replace(/[^\d]/g, '');
+        if (cleanImo.length !== 7) return jsonResponse({ error: 'Invalid IMO' }, 400, corsHeaders);
+
+        // Check not already tracked
+        const existing = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos', `imo=eq.${cleanImo}&user_id=eq.${user_id}&select=imo`, 'GET');
+        if (existing.length > 0) return jsonResponse({ error: 'Already tracked' }, 400, corsHeaders);
+
+        await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos', null, 'POST', { imo: cleanImo, user_id });
+
+        return jsonResponse({ success: true, imo: cleanImo }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Admin — Remove vessel from user's fleet
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/admin/fleet/remove' && request.method === 'POST') {
+        const body = await request.json();
+        const { admin_token, user_id, imo } = body;
+
+        if (!admin_token || !user_id || !imo) return jsonResponse({ error: 'admin_token, user_id and imo required' }, 400, corsHeaders);
+
+        const adminCheck = await verifyAdmin(env, admin_token);
+        if (!adminCheck.ok) return jsonResponse({ error: adminCheck.error }, adminCheck.status, corsHeaders);
+
+        const cleanImo = String(imo).replace(/[^\d]/g, '');
+
+        await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos', `imo=eq.${cleanImo}&user_id=eq.${user_id}`, 'DELETE');
+
+        // Clean up vessels table if no other trackers
+        const remaining = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos', `imo=eq.${cleanImo}&select=imo`, 'GET');
+        if (remaining.length === 0) {
+          await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'vessels', `imo=eq.${cleanImo}`, 'DELETE');
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Add Vessel
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/vessel/add' && request.method === 'POST') {
+        const body = await request.json();
+        const { imo, secret, user_token } = body;
+
+        // Determine auth mode and resolve user_id
+        let userId = null;
+
+        if (user_token) {
+          // Personal fleet — validate JWT
+          const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+            headers: {
+              'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+              'Authorization': `Bearer ${user_token}`,
+            },
+          });
+          if (!userRes.ok) {
+            return jsonResponse({ error: 'Invalid or expired token' }, 401, corsHeaders);
+          }
+          const user = await userRes.json();
+          userId = user.id;
+        } else if (secret === env.API_SECRET) {
+          // Public fleet — userId stays null
+          userId = null;
+        } else {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+
+        // Validate IMO
+        const cleanImo = String(imo).replace(/[^\d]/g, '');
+        if (cleanImo.length !== 7) {
+          return jsonResponse({ error: 'Invalid IMO number' }, 400, corsHeaders);
+        }
+
+        // Check if already tracked (for this user scope)
+        const existingQuery = userId
+          ? `imo=eq.${cleanImo}&user_id=eq.${userId}`
+          : `imo=eq.${cleanImo}&user_id=is.null`;
+
+        const existing = await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos',
+          existingQuery,
+          'GET'
+        );
+
+        if (existing.length > 0) {
+          return jsonResponse({ error: 'Vessel already tracked', imo: cleanImo }, 400, corsHeaders);
+        }
+
+        // Add to tracked_imos table
+        const insertRow = userId
+          ? { imo: cleanImo, user_id: userId }
+          : { imo: cleanImo };
+
+        await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos',
+          null,
+          'POST',
+          insertRow
+        );
+
+        // ─────────────────────────────────────────────────────────────────────
+        // FIX 1: Always trigger workflow when a vessel is added to tracking.
+        // Removed the vesselExists check — even if a row exists the data may be
+        // stale and needs a fresh scrape now that someone is actively tracking it.
+        // ─────────────────────────────────────────────────────────────────────
+        const workflowTriggered = await triggerGitHubWorkflow(
+          env.GITHUB_TOKEN,
+          env.GITHUB_REPO,
+          env.GITHUB_BRANCH || 'main'
+        );
+
+        return jsonResponse({
+          success: true,
+          imo: cleanImo,
+          message: 'Vessel added successfully',
+          workflowTriggered
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Remove Vessel
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/vessel/remove' && request.method === 'POST') {
+        const body = await request.json();
+        const { imo, secret, user_token } = body;
+
+        // Determine auth mode
+        let userId = null;
+        let isPublicFleet = false;
+
+        if (user_token) {
+          // Personal fleet — validate JWT
+          const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+            headers: {
+              'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+              'Authorization': `Bearer ${user_token}`,
+            },
+          });
+          if (!userRes.ok) {
+            return jsonResponse({ error: 'Invalid or expired token' }, 401, corsHeaders);
+          }
+          const user = await userRes.json();
+          userId = user.id;
+        } else if (secret === env.API_SECRET) {
+          isPublicFleet = true;
+        } else {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+
+        // Validate IMO
+        const cleanImo = String(imo).replace(/[^\d]/g, '');
+        if (cleanImo.length !== 7) {
+          return jsonResponse({ error: 'Invalid IMO number' }, 400, corsHeaders);
+        }
+
+        if (userId) {
+          // Personal fleet: remove from tracked_imos for this user
+          await supabaseFetch(
+            env.SUPABASE_URL,
+            env.SUPABASE_SERVICE_ROLE_KEY,
+            'tracked_imos',
+            `imo=eq.${cleanImo}&user_id=eq.${userId}`,
+            'DELETE'
+          );
+
+          // Check if any other user (or public fleet) still tracks this IMO.
+          // If nobody else tracks it, clean up vessels + static_vessel_cache so
+          // the next person to add it gets a fresh "First tracking detected" alert.
+          const remainingTrackers = await supabaseFetch(
+            env.SUPABASE_URL,
+            env.SUPABASE_SERVICE_ROLE_KEY,
+            'tracked_imos',
+            `imo=eq.${cleanImo}&select=imo`,
+            'GET'
+          );
+
+          if (remainingTrackers.length === 0) {
+            // Delete live AIS state so scraper treats next add as "first tracking"
+            // and fires the WhatsApp alert correctly.
+            // static_vessel_cache is intentionally kept — it stores vessel metadata
+            // (name, flag, dimensions) used for instant preview when re-adding the IMO.
+            await supabaseFetch(
+              env.SUPABASE_URL,
+              env.SUPABASE_SERVICE_ROLE_KEY,
+              'vessels',
+              `imo=eq.${cleanImo}`,
+              'DELETE'
+            );
+          }
+        } else {
+          // Public fleet: remove from tracked_imos, vessels, and static_vessel_cache
+          await supabaseFetch(
+            env.SUPABASE_URL,
+            env.SUPABASE_SERVICE_ROLE_KEY,
+            'tracked_imos',
+            `imo=eq.${cleanImo}&user_id=is.null`,
+            'DELETE'
+          );
+
+          // Remove from vessels table
+          await supabaseFetch(
+            env.SUPABASE_URL,
+            env.SUPABASE_SERVICE_ROLE_KEY,
+            'vessels',
+            `imo=eq.${cleanImo}`,
+            'DELETE'
+          );
+
+          // Remove from static_vessel_cache
+          await supabaseFetch(
+            env.SUPABASE_URL,
+            env.SUPABASE_SERVICE_ROLE_KEY,
+            'static_vessel_cache',
+            `imo=eq.${cleanImo}`,
+            'DELETE'
+          );
+        }
+
+        return jsonResponse({
+          success: true,
+          imo: cleanImo,
+          message: 'Vessel removed successfully',
+          workflowTriggered: false
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: List Tracked Vessels
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/vessels/list' && request.method === 'GET') {
+        const vessels = await supabaseFetch(
+          env.SUPABASE_URL,
+          env.SUPABASE_SERVICE_ROLE_KEY,
+          'tracked_imos',
+          'select=imo',
+          'GET'
+        );
+
+        return jsonResponse({
+          success: true,
+          count: vessels.length,
+          vessels: vessels.map(v => v.imo)
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: CallMeBot proxy — avoids browser CORS block
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/callmebot/test' && request.method === 'POST') {
+        const body = await request.json();
+        const { phone, apikey, message } = body;
+
+        if (!phone || !apikey) {
+          return jsonResponse({ error: 'phone and apikey required' }, 400, corsHeaders);
+        }
+
+        const text = encodeURIComponent(message || 'VesselTracker test alert 🚢');
+        const url  = `https://api.callmebot.com/whatsapp.php?phone=${encodeURIComponent(phone)}&text=${text}&apikey=${encodeURIComponent(apikey)}`;
+
+        try {
+          const r = await fetch(url, { method: 'GET' });
+          const responseText = await r.text();
+          if (r.ok || r.status === 200) {
+            return jsonResponse({ success: true, status: r.status, response: responseText }, 200, corsHeaders);
+          } else {
+            return jsonResponse({ success: false, status: r.status, response: responseText }, 200, corsHeaders);
+          }
+        } catch (err) {
+          return jsonResponse({ success: false, error: err.message }, 200, corsHeaders);
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: Weather proxy — multi-API fallback chain, all server-side
+      // Wind:  Open-Meteo → MET Norway (Yr.no) → 7Timer → wttr.in
+      // Wave:  Open-Meteo Marine → Open-Meteo wind-wave model
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/weather' && request.method === 'GET') {
+        const params = url.searchParams;
+        const lat = parseFloat(params.get('lat'));
+        const lon = parseFloat(params.get('lon'));
+
+        if (isNaN(lat) || isNaN(lon)) {
+          return jsonResponse({ error: 'lat and lon required' }, 400, corsHeaders);
+        }
+
+        const latF = lat.toFixed(4), lonF = lon.toFixed(4);
+        let wind = null, wave = null;
+
+        // ── PROVIDER 1: Open-Meteo (wind + wave) ─────────────────────────────
+        try {
+          const [marineRes, forecastRes] = await Promise.all([
+            fetch(`https://marine-api.open-meteo.com/v1/marine?latitude=${latF}&longitude=${lonF}&current=wave_height`),
+            fetch(`https://api.open-meteo.com/v1/forecast?latitude=${latF}&longitude=${lonF}&current=wind_speed_10m&wind_speed_unit=kn`),
+          ]);
+          if (forecastRes.ok) {
+            const d = await forecastRes.json();
+            if (d.current?.wind_speed_10m != null) wind = Number(d.current.wind_speed_10m);
+          }
+          if (marineRes.ok) {
+            const d = await marineRes.json();
+            if (d.current?.wave_height != null) wave = Number(d.current.wave_height);
+          }
+        } catch (_) {}
+
+        // ── PROVIDER 2: MET Norway / Yr.no (wind fallback) ───────────────────
+        // wind_speed in m/s → knots (×1.944)
+        if (wind === null) {
+          try {
+            const r = await fetch(
+              `https://api.met.no/weatherapi/locationforecast/2.0/compact?lat=${latF}&lon=${lonF}`,
+              { headers: { 'User-Agent': 'VesselTracker/5.5 github.com/asmahri2-afk' } }
+            );
+            if (r.ok) {
+              const d = await r.json();
+              const ms = d.properties?.timeseries?.[0]?.data?.instant?.details?.wind_speed;
+              if (ms != null) wind = Number(ms) * 1.944;
+            }
+          } catch (_) {}
+        }
+
+        // ── PROVIDER 3: 7Timer (wind fallback) ───────────────────────────────
+        // Uses Beaufort scale — map to knot midpoints
+        if (wind === null) {
+          try {
+            const r = await fetch(
+              `https://www.7timer.info/bin/api.pl?lon=${lonF}&lat=${latF}&product=meteo&output=json`
+            );
+            if (r.ok) {
+              const d = await r.json();
+              const bft = d.dataseries?.[0]?.wind10m?.speed;
+              const bftKnots = { 1: 2, 2: 5, 3: 9, 4: 13, 5: 19, 6: 25, 7: 32, 8: 40 };
+              if (bft != null) wind = bftKnots[bft] ?? bft * 3;
+            }
+          } catch (_) {}
+        }
+
+        // ── PROVIDER 4: wttr.in (wind fallback) ──────────────────────────────
+        // windspeedKmph → knots (÷1.852)
+        if (wind === null) {
+          try {
+            const r = await fetch(`https://wttr.in/${latF},${lonF}?format=j1`);
+            if (r.ok) {
+              const d = await r.json();
+              const kmh = d.current_condition?.[0]?.windspeedKmph;
+              if (kmh != null) wind = Number(kmh) / 1.852;
+            }
+          } catch (_) {}
+        }
+
+        // ── PROVIDER 5: Open-Meteo wind-wave model (wave fallback) ───────────
+        if (wave === null) {
+          try {
+            const r = await fetch(
+              `https://api.open-meteo.com/v1/forecast?latitude=${latF}&longitude=${lonF}&current=wind_wave_height`
+            );
+            if (r.ok) {
+              const d = await r.json();
+              if (d.current?.wind_wave_height != null) wave = Number(d.current.wind_wave_height);
+            }
+          } catch (_) {}
+        }
+
+        return jsonResponse({
+          wave: wave !== null ? Math.round(wave * 10) / 10 : null,
+          wind: wind !== null ? Math.round(wind * 10) / 10 : null,
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Draft — Load
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/draft' && request.method === 'GET') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const user = await userRes.json();
+
+        const imo = url.searchParams.get('imo');
+        if (!imo) return jsonResponse({ error: 'imo required' }, 400, corsHeaders);
+
+        const rows = await supabaseFetch(
+          env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'sof_drafts', `imo=eq.${imo}&user_id=eq.${user.id}&select=data,notes,updated_at`, 'GET'
+        );
+
+        if (!rows.length) return jsonResponse({ draft: null }, 200, corsHeaders);
+        return jsonResponse({ draft: rows[0].data, notes: rows[0].notes, updated_at: rows[0].updated_at }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Draft — Save
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/draft' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const user = await userRes.json();
+
+        const body = await request.json();
+        const { imo, data, notes } = body;
+        if (!imo || !data) return jsonResponse({ error: 'imo and data required' }, 400, corsHeaders);
+
+        // Upsert — update if exists, insert if not
+        const existing = await supabaseFetch(
+          env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'sof_drafts', `imo=eq.${String(imo)}&user_id=eq.${user.id}&select=id`, 'GET'
+        );
+
+        if (existing.length > 0) {
+          await supabaseFetch(
+            env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_drafts', `imo=eq.${String(imo)}&user_id=eq.${user.id}`, 'PATCH',
+            { data, notes: notes || null, updated_at: new Date().toISOString() }
+          );
+        } else {
+          await supabaseFetch(
+            env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_drafts', null, 'POST',
+            { imo: String(imo), user_id: user.id, data, notes: notes || null, updated_at: new Date().toISOString() }
+          );
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Draft — Delete
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/draft' && request.method === 'DELETE') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) {
+          return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        }
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const user = await userRes.json();
+
+        const imo = url.searchParams.get('imo');
+        if (!imo) return jsonResponse({ error: 'imo required' }, 400, corsHeaders);
+
+        await supabaseFetch(
+          env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'sof_drafts', `imo=eq.${imo}&user_id=eq.${user.id}`, 'DELETE'
+        );
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: List all users (for handoff recipient picker)
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/users/list' && request.method === 'GET') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const me = await userRes.json();
+
+        const users = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles', `select=id,username&id=neq.${me.id}`, 'GET');
+
+        return jsonResponse({ users }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Handoff — Send
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/handoff/send' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const me = await userRes.json();
+
+        const body = await request.json();
+        const { to_user_id, imo, vessel_name, draft_data, notes } = body;
+        if (!to_user_id || !imo || !draft_data) return jsonResponse({ error: 'to_user_id, imo and draft_data required' }, 400, corsHeaders);
+
+        // Get sender username
+        const myProfile = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles', `id=eq.${me.id}&select=username`, 'GET');
+        const fromUsername = myProfile[0]?.username || 'Unknown';
+
+        // Get recipient username
+        const toProfile = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'user_profiles', `id=eq.${to_user_id}&select=username`, 'GET');
+        if (!toProfile.length) return jsonResponse({ error: 'Recipient not found' }, 404, corsHeaders);
+        const toUsername = toProfile[0].username;
+
+        await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'sof_handoffs', null, 'POST', {
+            from_user_id: me.id,
+            to_user_id,
+            from_username: fromUsername,
+            to_username: toUsername,
+            imo: String(imo),
+            vessel_name: vessel_name || '',
+            draft_data,
+            notes: notes || null,
+            status: 'pending',
+            sender_notified: false,
+          });
+
+        return jsonResponse({ success: true, to_username: toUsername }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Handoff — Get pending (incoming + unseen declines for sender)
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/handoff/pending' && request.method === 'GET') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const me = await userRes.json();
+
+        const [incoming, declines] = await Promise.all([
+          // Pending handoffs sent TO me
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_handoffs',
+            `to_user_id=eq.${me.id}&status=eq.pending&select=id,from_username,imo,vessel_name,notes,created_at`,
+            'GET'),
+          // Handoffs I sent that were declined and I haven't seen yet
+          supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_handoffs',
+            `from_user_id=eq.${me.id}&status=eq.declined&sender_notified=eq.false&select=id,to_username,imo,vessel_name`,
+            'GET'),
+        ]);
+
+        return jsonResponse({
+          incoming,
+          declines,
+          total: incoming.length + declines.length,
+        }, 200, corsHeaders);
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Handoff — Respond (accept or decline)
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/handoff/respond' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const me = await userRes.json();
+
+        const body = await request.json();
+        const { id, action } = body; // action: 'accept' | 'decline'
+        if (!id || !['accept', 'decline'].includes(action)) return jsonResponse({ error: 'id and action required' }, 400, corsHeaders);
+
+        // Get the handoff
+        const handoffs = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+          'sof_handoffs', `id=eq.${id}&to_user_id=eq.${me.id}&status=eq.pending&select=*`, 'GET');
+        if (!handoffs.length) return jsonResponse({ error: 'Handoff not found' }, 404, corsHeaders);
+        const handoff = handoffs[0];
+
+        if (action === 'accept') {
+          // 1. Save draft to recipient's sof_drafts (upsert)
+          const existingDraft = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_drafts', `imo=eq.${handoff.imo}&user_id=eq.${me.id}&select=id`, 'GET');
+          if (existingDraft.length > 0) {
+            await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+              'sof_drafts', `imo=eq.${handoff.imo}&user_id=eq.${me.id}`, 'PATCH',
+              { data: handoff.draft_data, notes: handoff.notes, updated_at: new Date().toISOString() });
+          } else {
+            await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+              'sof_drafts', null, 'POST',
+              { imo: handoff.imo, user_id: me.id, data: handoff.draft_data, notes: handoff.notes, updated_at: new Date().toISOString() });
+          }
+
+          // 2. Add vessel to recipient's fleet if not already tracked
+          const alreadyTracked = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'tracked_imos', `imo=eq.${handoff.imo}&user_id=eq.${me.id}&select=imo`, 'GET');
+          if (!alreadyTracked.length) {
+            await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+              'tracked_imos', null, 'POST', { imo: handoff.imo, user_id: me.id });
+          }
+
+          // 3. Mark handoff accepted
+          await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_handoffs', `id=eq.${id}`, 'PATCH', { status: 'accepted' });
+
+          return jsonResponse({ success: true, action: 'accepted', vessel_added: !alreadyTracked.length }, 200, corsHeaders);
+
+        } else {
+          // Decline — mark declined, sender_notified = false so sender gets notified
+          await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_handoffs', `id=eq.${id}`, 'PATCH', { status: 'declined', sender_notified: false });
+
+          return jsonResponse({ success: true, action: 'declined' }, 200, corsHeaders);
+        }
+      }
+
+      // ─────────────────────────────────────────────────────────────────────────
+      // ROUTE: SOF Handoff — Acknowledge decline notifications
+      // ─────────────────────────────────────────────────────────────────────────
+      if (path === '/sof/handoff/ack' && request.method === 'POST') {
+        const authHeader = request.headers.get('Authorization');
+        if (!authHeader?.startsWith('Bearer ')) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const token = authHeader.slice(7);
+        const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+          headers: { 'apikey': env.SUPABASE_SERVICE_ROLE_KEY, 'Authorization': `Bearer ${token}` },
+        });
+        if (!userRes.ok) return jsonResponse({ error: 'Unauthorized' }, 401, corsHeaders);
+        const me = await userRes.json();
+
+        const body = await request.json();
+        const ids = body.ids || [];
+        if (!ids.length) return jsonResponse({ success: true }, 200, corsHeaders);
+
+        // Mark all as sender_notified = true
+        for (const id of ids) {
+          await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+            'sof_handoffs', `id=eq.${id}&from_user_id=eq.${me.id}`, 'PATCH', { sender_notified: true });
+        }
+
+        return jsonResponse({ success: true }, 200, corsHeaders);
+      }
+
+      // Default 404
+      return jsonResponse({ error: 'Not found' }, 404, corsHeaders);
+
+    } catch (error) {
+      console.error('Worker error:', error);
+      return jsonResponse({
+        error: 'Internal server error',
+        message: error.message
+      }, 500, corsHeaders);
+    }
+  }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function triggerGitHubWorkflow(token, repo, branch) {
+  if (!token || !repo) {
+    console.warn('GitHub credentials missing — set GITHUB_TOKEN and GITHUB_REPO in Worker env vars');
+    return false;
+  }
+
+  try {
+    const [owner, repoName] = repo.split('/');
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // FIX 2: Correct workflow filename — removed the "__2_" artifact suffix.
+    // The real file in your GitHub repo is "update_vessels.yml".
+    // If your file has a different name, update this to match exactly.
+    // ─────────────────────────────────────────────────────────────────────────
+    const workflowFile = 'update_vessels.yml';
+    const url = `https://api.github.com/repos/${owner}/${repoName}/actions/workflows/${workflowFile}/dispatches`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `token ${token}`,
+        'Accept': 'application/vnd.github.v3+json',
+        'Content-Type': 'application/json',
+        'User-Agent': 'Cloudflare-Worker-Vessel-Manager'
+      },
+      body: JSON.stringify({ ref: branch })
+    });
+
+    if (response.status === 204) {
+      console.log('✅ GitHub workflow triggered successfully');
+      return true;
+    } else {
+      const text = await response.text();
+      console.error(`❌ GitHub workflow trigger failed: ${response.status} — ${text}`);
+      return false;
+    }
+  } catch (error) {
+    console.error('Error triggering workflow:', error);
+    return false;
+  }
+}
+
+async function supabaseFetch(url, key, table, query, method, body = null) {
+  const endpoint = query
+    ? `${url}/rest/v1/${table}?${query}`
+    : `${url}/rest/v1/${table}`;
+
+  const options = {
+    method,
+    headers: {
+      'apikey': key,
+      'Authorization': `Bearer ${key}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=minimal'
+    }
+  };
+
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(endpoint, options);
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Supabase error (${response.status}): ${text}`);
+  }
+
+  if (method === 'DELETE' || method === 'PATCH' || response.status === 204 || response.status === 201) {
+    return [];
+  }
+
+  // Guard against any other unexpected empty body
+  const text = await response.text();
+  if (!text) return [];
+  return JSON.parse(text);
+}
+
+// ── Admin auth helper ─────────────────────────────────────────────────────────
+async function verifyAdmin(env, token) {
+  const userRes = await fetch(`${env.SUPABASE_URL}/auth/v1/user`, {
+    headers: {
+      'apikey': env.SUPABASE_SERVICE_ROLE_KEY,
+      'Authorization': `Bearer ${token}`,
+    },
+  });
+  if (!userRes.ok) return { ok: false, error: 'Unauthorized', status: 401 };
+  const user = await userRes.json();
+  const profile = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
+    'user_profiles', `id=eq.${user.id}&select=username`, 'GET');
+  if (!profile.length || profile[0].username !== 'asmahri') {
+    return { ok: false, error: 'Forbidden', status: 403 };
+  }
+  return { ok: true };
+}
+
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      ...headers
+    }
+  });
+}

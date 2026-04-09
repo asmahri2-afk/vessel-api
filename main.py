@@ -966,8 +966,9 @@ export default {
         const me = await userRes.json();
 
         const users = await supabaseFetch(env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY,
-          'user_profiles', `select=id,username&id=neq.${me.id}`, 'GET');
+          'user_profiles', `select=id,username&id=neq.${me.id}&order=username.asc`, 'GET');
 
+        console.log(`users/list: me=${me.id}, found ${users.length} other users`);
         return jsonResponse({ users }, 200, corsHeaders);
       }
 

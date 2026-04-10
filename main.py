@@ -30,6 +30,10 @@ from openpyxl import load_workbook
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 logger = logging.getLogger(__name__)
 
+
+@app.get("/ping")
+def ping():
+    return {"ok": True}
 # ============================================================
 # CONFIG
 # ============================================================

@@ -31,14 +31,22 @@ logger = logging.getLogger(__name__)
 # HTTP CONFIG
 # ============================================================
 
+import random
+
+# Rotate User-Agents to reduce VesselFinder bot detection
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+]
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": random.choice(_USER_AGENTS),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Referer": "https://www.vesselfinder.com/",
+    "DNT": "1",
 }
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
@@ -46,7 +54,7 @@ MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTT
 API_SECRET  = os.getenv("API_SECRET", "")
 
 # Max parallel workers for batch — keep low to avoid hammering VesselFinder
-BATCH_MAX_WORKERS = 4
+BATCH_MAX_WORKERS = 2  # Reduced from 4 — fewer parallel requests reduces bot detection risk
 BATCH_MAX_IMOS    = 50  # safety cap per batch request
 
 # ============================================================
@@ -395,7 +403,11 @@ def vessel_batch(body: BatchRequest, request: Request):
 
     def fetch_one(imo: str) -> tuple:
         try:
+            # Random delay 2-5s between requests to avoid rate limiting
+            time.sleep(random.uniform(2, 5))
             with requests.Session() as session:
+                # Rotate User-Agent per request
+                HEADERS["User-Agent"] = random.choice(_USER_AGENTS)
                 data = scrape_vf_full(imo, session)
             if not data.get("found"):
                 return imo, None, "Vessel not found"

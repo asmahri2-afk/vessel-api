@@ -40,129 +40,29 @@ _USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
 ]
 
-def _make_headers(referer: str = "https://www.vesselfinder.com/") -> Dict[str, str]:
-    """Fresh randomised headers every call."""
+def _make_headers() -> dict:
+    """Generate fresh randomised headers on every call — never share a global mutable dict."""
     ua = random.choice(_USER_AGENTS)
-    is_firefox = "Firefox" in ua
     return {
-        "User-Agent":      ua,
-        "Accept-Language": random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.8", "en-US,en;q=0.8,fr;q=0.5"]),
-        "Accept":          (
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-            if is_firefox else
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer":         referer,
-        "DNT":             "1",
+        "User-Agent":                ua,
+        "Accept-Language":           random.choice(["en-US,en;q=0.9", "en-GB,en;q=0.8"]),
+        "Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding":           "gzip, deflate, br",
+        "Referer":                   "https://www.vesselfinder.com/",
+        "DNT":                       "1",
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest":  "document",
-        "Sec-Fetch-Mode":  "navigate",
-        "Sec-Fetch-Site":  "same-origin",
-        "Sec-Fetch-User":  "?1",
     }
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
 
-API_SECRET        = os.getenv("API_SECRET", "")
-SCRAPE_DO_TOKEN   = os.getenv("SCRAPE_DO_TOKEN", "")
-SCRAPE_DO_API     = "http://api.scrape.do"
-
-# ── Credit tiers (cheapest → most expensive) ──────────────────
-# Tier 0 : direct request          →  0 credits
-# Tier 1 : scrape.do Super only    →  ~5–10 credits
-# Tier 2 : scrape.do Super+Render  →  ~25 credits  (last resort)
-
-# Block-detection keywords in response body
-_BLOCK_SIGNALS = [
-    "captcha", "cf-browser-verification", "access denied",
-    "rate limit", "too many requests", "blocked", "403 forbidden",
-    "robot", "are you human", "ddos-guard",
-]
-
-def _is_blocked(text: str) -> bool:
-    low = text.lower()
-    return any(sig in low for sig in _BLOCK_SIGNALS)
-
-def _has_vessel_content(text: str) -> bool:
-    """Quick sanity-check that the page actually has vessel data."""
-    return "vessel" in text.lower() and ("imo" in text.lower() or "mmsi" in text.lower())
-
-def _scrape_do_get(
-    url: str,
-    session: requests.Session,
-    render: bool = False,
-    timeout: int = 45,
-) -> requests.Response:
-    """
-    Route a request through scrape.do.
-    render=False  → Super proxies only      (~5–10 credits) — use first
-    render=True   → Super proxies + JS render (~25 credits) — last resort
-    """
-    params = {
-        "token":               SCRAPE_DO_TOKEN,
-        "url":                 url,
-        "super":               "true",          # Residential & Mobile proxies
-        "transparentResponse": "true",          # Real HTTP status codes
-        "device":              "desktop",
-        "customHeaders":       "true",          # Forward our headers below
-    }
-    if render:
-        params["render"] = "true"
-        params["timeout"] = str(timeout * 1000)   # ms
-
-    headers = _make_headers()
-    mode = "Super+Render" if render else "Super"
-    logger.info(f"scrape.do [{mode}] → {url}")
-    return session.get(SCRAPE_DO_API, params=params, headers=headers, timeout=timeout + 10)
-
-def fetch_with_fallback(url: str, session: requests.Session) -> requests.Response:
-    """
-    3-tier fetch with credit-aware fallback:
-      1. Direct (free)
-      2. scrape.do Super only  (cheap)
-      3. scrape.do Super+Render (expensive — only if HTML looks empty/bad)
-    """
-    # ── Tier 0: direct ───────────────────────────────────────────
-    try:
-        time.sleep(random.uniform(1.5, 3.5))   # human-like delay
-        r = session.get(url, headers=_make_headers(), timeout=25)
-        if r.status_code == 404:
-            return r   # definitive — no point proxying
-        if r.status_code == 200 and not _is_blocked(r.text) and _has_vessel_content(r.text):
-            logger.info(f"Direct OK → {url}")
-            return r
-        reason = f"status={r.status_code}" if r.status_code != 200 else "block/captcha detected"
-        logger.warning(f"Direct blocked ({reason}) — falling back to scrape.do")
-    except Exception as e:
-        logger.warning(f"Direct request failed ({e}) — falling back to scrape.do")
-
-    if not SCRAPE_DO_TOKEN:
-        raise RuntimeError("Direct request failed and SCRAPE_DO_TOKEN is not set")
-
-    # ── Tier 1: scrape.do Super (no render) ──────────────────────
-    try:
-        r = _scrape_do_get(url, session, render=False)
-        if r.status_code == 404:
-            return r
-        if r.status_code == 200 and not _is_blocked(r.text) and _has_vessel_content(r.text):
-            logger.info(f"scrape.do Super OK → {url}")
-            return r
-        logger.warning(f"scrape.do Super returned bad content — escalating to Render tier")
-    except Exception as e:
-        logger.warning(f"scrape.do Super failed ({e}) — escalating to Render tier")
-
-    # ── Tier 2: scrape.do Super + Render (expensive, last resort) ─
-    logger.warning(f"Using scrape.do Super+Render (expensive) for {url}")
-    r = _scrape_do_get(url, session, render=True)
-    return r
-
-# Max parallel workers for batch
-BATCH_MAX_WORKERS = 2
+API_SECRET      = os.getenv("API_SECRET", "")
+BATCH_MAX_WORKERS = 1   # sequential — one at a time is safest against VF detection
 BATCH_MAX_IMOS    = 50  # safety cap per batch request
+BATCH_SIZE        = 5   # cooldown pause after every N vessels
+BATCH_COOLDOWN    = 30  # seconds to pause between batches
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -309,7 +209,8 @@ def get_myshiptracking_pos(
         }),
     }
 
-    mst_headers = _make_headers(referer="https://www.myshiptracking.com/")
+    mst_headers = _make_headers()
+    mst_headers["Referer"] = "https://www.myshiptracking.com/"
 
     try:
         r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
@@ -344,7 +245,10 @@ def get_myshiptracking_pos(
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
 
-    r = fetch_with_fallback(url, session)
+    # Human-like delay before each request
+    time.sleep(random.uniform(2.0, 5.0))
+
+    r = session.get(url, headers=_make_headers(), timeout=25)
 
     if r.status_code == 404:
         logger.info(f"IMO {imo} returned 404 from VesselFinder")
@@ -509,10 +413,8 @@ def vessel_batch(body: BatchRequest, request: Request):
 
     def fetch_one(imo: str) -> tuple:
         try:
-            # Stagger requests to avoid simultaneous hits
-            time.sleep(random.uniform(3, 7))
             with requests.Session() as session:
-                data = scrape_vf_full(imo, session)
+                data = scrape_vf_full(imo, session)  # delay already inside scrape_vf_full
             if not data.get("found"):
                 return imo, None, "Vessel not found"
             return imo, data, None
@@ -520,16 +422,22 @@ def vessel_batch(body: BatchRequest, request: Request):
             logger.error(f"Batch scrape failed for IMO {imo}: {e}")
             return imo, None, str(e)
 
-    logger.info(f"Batch request: {len(imos)} vessels, {BATCH_MAX_WORKERS} workers")
+    logger.info(f"Batch request: {len(imos)} vessels | batch_size={BATCH_SIZE} cooldown={BATCH_COOLDOWN}s")
 
-    with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as executor:
-        futures = {executor.submit(fetch_one, imo): imo for imo in imos}
-        for future in as_completed(futures):
-            imo, data, error = future.result()
+    # Process sequentially in batches of BATCH_SIZE with a cooldown between batches
+    for batch_start in range(0, len(imos), BATCH_SIZE):
+        batch = imos[batch_start:batch_start + BATCH_SIZE]
+        logger.info(f"Processing batch {batch_start // BATCH_SIZE + 1}: IMOs {batch}")
+        for imo in batch:
+            imo_r, data, error = fetch_one(imo)
             if error:
-                errors[imo] = error
+                errors[imo_r] = error
             else:
-                results[imo] = data
+                results[imo_r] = data
+        # Cooldown between batches (skip after last batch)
+        if batch_start + BATCH_SIZE < len(imos):
+            logger.info(f"Batch cooldown: sleeping {BATCH_COOLDOWN}s before next batch...")
+            time.sleep(BATCH_COOLDOWN)
 
     logger.info(f"Batch complete: {len(results)} success, {len(errors)} errors")
 

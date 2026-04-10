@@ -69,7 +69,7 @@ MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTT
 
 API_SECRET        = os.getenv("API_SECRET", "")
 SCRAPE_DO_TOKEN   = os.getenv("SCRAPE_DO_TOKEN", "")
-SCRAPE_DO_API     = "https://api.scrape.do"
+SCRAPE_DO_API     = "http://api.scrape.do"
 
 # ── Credit tiers (cheapest → most expensive) ──────────────────
 # Tier 0 : direct request          →  0 credits

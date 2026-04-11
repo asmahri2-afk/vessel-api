@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import re
+import time
+import random
 import requests
 import httpx
 import io
@@ -16,6 +18,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -31,43 +34,84 @@ logger = logging.getLogger(__name__)
 # HTTP CONFIG
 # ============================================================
 
-import random
-
-# Rotate User-Agents to reduce VesselFinder bot detection
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
 ]
 
 def _make_headers(referer: str = "https://www.vesselfinder.com/") -> dict:
-    """Return a fresh headers dict with a randomly rotated User-Agent per call."""
     return {
         "User-Agent": random.choice(_USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Referer": referer,
         "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
-# Keep a module-level alias for any code that still references HEADERS directly
+def _make_xhr_headers(referer: str = "https://www.marinetraffic.com/") -> dict:
+    """Headers that mimic an XHR/fetch call from inside the MT page."""
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer,
+        "Origin": "https://www.marinetraffic.com",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "DNT": "1",
+        "Connection": "keep-alive",
+    }
+
 HEADERS = _make_headers()
-
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
+API_SECRET         = os.getenv("API_SECRET", "")
+BATCH_MAX_WORKERS  = 2
+BATCH_MAX_IMOS     = 50
 
-API_SECRET  = os.getenv("API_SECRET", "")
+# ============================================================
+# MARINETRAFFIC CACHE
+# Per-IMO in-memory cache so we never hit MT twice within TTL
+# ============================================================
 
-# Max parallel workers for batch — keep low to avoid hammering VesselFinder
-BATCH_MAX_WORKERS = 2  # Reduced from 4 — fewer parallel requests reduces bot detection risk
-BATCH_MAX_IMOS    = 50  # safety cap per batch request
+_mt_cache: Dict[str, Dict[str, Any]] = {}
+MT_CACHE_TTL_SECONDS = 30 * 60  # 30 minutes
+
+# ============================================================
+# SCRAPER ORDER — EASY SWITCH
+# ============================================================
+#
+#  ┌─────────────────────────────────────────────────────────┐
+#  │  CURRENT ORDER (testing):  MT → VF → MST               │
+#  │                                                         │
+#  │  TO SWITCH BACK TO PRODUCTION ORDER (VF → MT → MST):   │
+#  │  In scrape_vessel_full() below, swap the two lines:     │
+#  │                                                         │
+#  │  Change:                                                │
+#  │    primary_data   = scrape_mt_full(imo)                 │
+#  │    secondary_data = scrape_vf_full(imo, session)        │
+#  │                                                         │
+#  │  To:                                                    │
+#  │    primary_data   = scrape_vf_full(imo, session)        │
+#  │    secondary_data = scrape_mt_full(imo)                 │
+#  │                                                         │
+#  │  That's the only change needed — nothing else moves.   │
+#  └─────────────────────────────────────────────────────────┘
 
 # ============================================================
 # FASTAPI APP + CORS
 # ============================================================
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -129,7 +173,7 @@ def validate_imo(imo: str) -> bool:
         return False
 
 # ============================================================
-# HTML HELPERS – VESSELFINDER
+# HTML HELPERS — VESSELFINDER
 # ============================================================
 
 def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
@@ -137,15 +181,10 @@ def extract_table_data(soup: BeautifulSoup, table_class: str) -> Dict[str, str]:
     tables = soup.find_all(class_=table_class)
     if not tables:
         return data
-
     for table in tables:
         for row in table.find_all("tr"):
-            label_el = row.find(
-                class_=lambda x: x and ("tpc1" in x or "tpx1" in x or "n3" in x)
-            )
-            value_el = row.find(
-                class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x)
-            )
+            label_el = row.find(class_=lambda x: x and ("tpc1" in x or "tpx1" in x or "n3" in x))
+            value_el = row.find(class_=lambda x: x and ("tpc2" in x or "tpx2" in x or "v3" in x))
             if not (label_el and value_el):
                 continue
             label_parts = [c.strip() for c in label_el.contents if isinstance(c, str)]
@@ -174,7 +213,7 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPER
+# MYSHIPTRACKING — LAST RESORT
 # ============================================================
 
 def get_myshiptracking_pos(
@@ -186,14 +225,12 @@ def get_myshiptracking_pos(
 ) -> Optional[Dict[str, Any]]:
     if center_lat is None or center_lon is None:
         return None
-
     try:
         lat_f, lon_f = float(center_lat), float(center_lon)
     except (TypeError, ValueError):
         return None
 
     current_year = datetime.now().year
-
     params = {
         "type": "json",
         "minlat": lat_f - pad, "maxlat": lat_f + pad,
@@ -206,19 +243,15 @@ def get_myshiptracking_pos(
             "mapflt_from": "", "mapflt_dest": "",
         }),
     }
-
     mst_headers = _make_headers(referer="https://www.myshiptracking.com/")
-
     try:
         r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
         if r.status_code != 200:
             logger.warning(f"MyShipTracking returned status {r.status_code} for MMSI {mmsi}")
             return None
-
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
         if len(lines) < 3:
             return None
-
         target_mmsi = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
@@ -229,36 +262,192 @@ def get_myshiptracking_pos(
                     "sog": float(parts[6]) if parts[6] != "" else None,
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
                 }
-
     except Exception as e:
         logger.warning(f"MyShipTracking fetch failed for MMSI {mmsi}: {e}")
-
     return None
 
 # ============================================================
-# MAIN SCRAPER
+# MARINETRAFFIC SCRAPER — PRIMARY (test mode)
+# Uses cloudscraper to bypass Cloudflare + human-like timing
+# ============================================================
+
+def scrape_mt_full(imo: str) -> Optional[Dict[str, Any]]:
+    """
+    Scrape MarineTraffic for vessel position and static data.
+    Flow: resolve IMO → shipId → fetch general + position endpoints.
+    Results are cached per IMO for MT_CACHE_TTL_SECONDS to minimise hits.
+    """
+
+    # ── Cache check ──────────────────────────────────────────
+    cached = _mt_cache.get(imo)
+    if cached:
+        age = time.time() - cached["fetched_at"]
+        if age < MT_CACHE_TTL_SECONDS:
+            logger.info(f"MT cache hit for IMO {imo} ({int(age)}s old)")
+            return cached["data"]
+
+    try:
+        import cloudscraper  # pip install cloudscraper
+    except ImportError:
+        logger.error("cloudscraper not installed — cannot scrape MarineTraffic")
+        return None
+
+    try:
+        # ── Create cloudscraper session ───────────────────────
+        # browser dict makes it impersonate a real Chrome on Windows
+        scraper = cloudscraper.create_scraper(
+            browser={
+                "browser": "chrome",
+                "platform": "windows",
+                "desktop": True,
+            }
+        )
+
+        ua = random.choice(_USER_AGENTS)
+        scraper.headers.update({
+            "User-Agent": ua,
+            "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        })
+
+        # ── Step 1: land on MT homepage briefly to get cookies ─
+        # This mimics a user who navigated to the site before searching
+        logger.info(f"MT: Warming session for IMO {imo}")
+        scraper.get("https://www.marinetraffic.com/", timeout=20)
+        time.sleep(random.uniform(1.5, 3.0))  # human read time on homepage
+
+        # ── Step 2: resolve IMO → shipId ─────────────────────
+        # MT redirects /imo:XXXXXXX to /shipid:NNNNNN
+        resolve_url = f"https://www.marinetraffic.com/en/ais/details/ships/imo:{imo}"
+        logger.info(f"MT: Resolving IMO {imo}")
+        r_resolve = scraper.get(resolve_url, timeout=20)
+
+        # Extract shipId from final URL after redirect
+        ship_id = None
+        m = re.search(r'shipid[:/](\d+)', r_resolve.url, re.IGNORECASE)
+        if m:
+            ship_id = m.group(1)
+        else:
+            # Fallback: search in page HTML
+            m = re.search(r'"shipId"\s*:\s*(\d+)', r_resolve.text)
+            if m:
+                ship_id = m.group(1)
+            else:
+                # Try meta og:url or canonical
+                m = re.search(r'shipid[:/](\d+)', r_resolve.text, re.IGNORECASE)
+                if m:
+                    ship_id = m.group(1)
+
+        if not ship_id:
+            logger.warning(f"MT: Could not resolve shipId for IMO {imo} — final URL: {r_resolve.url}")
+            return None
+
+        logger.info(f"MT: IMO {imo} → shipId {ship_id}")
+
+        # ── Step 3: get CSRF token — MT requires this for XHR ─
+        time.sleep(random.uniform(0.8, 1.8))
+        scraper.get(
+            "https://www.marinetraffic.com/en/ajax_user_settings/get_csrf_token",
+            headers=_make_xhr_headers(),
+            timeout=10,
+        )
+
+        # ── Step 4: fetch general (static data) ──────────────
+        time.sleep(random.uniform(1.2, 2.5))  # mimic tab render before XHR fires
+        r_gen = scraper.get(
+            f"https://www.marinetraffic.com/en/vessels/{ship_id}/general",
+            headers=_make_xhr_headers(
+                referer=f"https://www.marinetraffic.com/en/ais/details/ships/shipid:{ship_id}"
+            ),
+            timeout=15,
+        )
+        if r_gen.status_code != 200:
+            logger.warning(f"MT: /general returned {r_gen.status_code} for shipId {ship_id}")
+            return None
+        general = r_gen.json()
+
+        # ── Step 5: fetch position ────────────────────────────
+        time.sleep(random.uniform(0.8, 1.6))  # stagger like real page loading sections
+        r_pos = scraper.get(
+            f"https://www.marinetraffic.com/en/vessels/{ship_id}/position",
+            headers=_make_xhr_headers(
+                referer=f"https://www.marinetraffic.com/en/ais/details/ships/shipid:{ship_id}"
+            ),
+            timeout=15,
+        )
+        if r_pos.status_code != 200:
+            logger.warning(f"MT: /position returned {r_pos.status_code} for shipId {ship_id}")
+            return None
+        position = r_pos.json()
+
+        # ── Build result ──────────────────────────────────────
+        lat = position.get("lat")
+        lon = position.get("lon")
+        sog = position.get("speed")
+        cog = position.get("course")
+        draught = position.get("draught")
+        nav_status = position.get("navigationalStatus", "")
+
+        if lat is None or lon is None:
+            logger.warning(f"MT: No position data for IMO {imo}")
+            return None
+
+        result = {
+            # Position
+            "lat":              float(lat),
+            "lon":              float(lon),
+            "sog":              sog,
+            "cog":              cog,
+            "draught_m":        str(draught) if draught else "",
+            "nav_status":       nav_status,
+            "ais_source":       "marinetraffic",
+            # Static — from general endpoint
+            "mmsi":             str(general.get("mmsi", "")),
+            "vessel_name":      general.get("name", "") or general.get("aisName", ""),
+            "ship_type":        general.get("type", ""),
+            "flag":             general.get("country", ""),
+            "length_overall_m": str(general.get("length", "")) if general.get("length") else "",
+            "beam_m":           str(general.get("width", ""))  if general.get("width")  else "",
+            "year_of_build":    str(general.get("yearBuilt", "")) if general.get("yearBuilt") else "",
+            "callsign":         general.get("callsign", ""),
+        }
+
+        # ── Cache result ──────────────────────────────────────
+        _mt_cache[imo] = {"data": result, "fetched_at": time.time()}
+        logger.info(
+            f"MT: IMO {imo} | lat={lat}, lon={lon}, sog={sog}, "
+            f"status={nav_status}, source=marinetraffic"
+        )
+        return result
+
+    except Exception as e:
+        logger.warning(f"MT scrape failed for IMO {imo}: {type(e).__name__}: {e}")
+        return None
+
+# ============================================================
+# VESSELFINDER SCRAPER — SECONDARY (test mode)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     url = f"https://www.vesselfinder.com/vessels/details/{imo}"
-
     r = session.get(url, headers=_make_headers(), timeout=20)
-
     if r.status_code == 404:
-        logger.info(f"IMO {imo} returned 404 from VesselFinder")
+        logger.info(f"VF: IMO {imo} returned 404")
         return {"found": False, "imo": imo}
     r.raise_for_status()
 
     soup = BeautifulSoup(r.text, "html.parser")
-
-    name_el = soup.select_one("h1.title")
-    name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
-    dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
+    name_el    = soup.select_one("h1.title")
+    name       = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
+    dest_el    = soup.select_one("div.vi__r1.vi__sbt a._npNa")
     destination = dest_el.get_text(strip=True) if dest_el else ""
-
-    info_icon = soup.select_one("svg.ttt1.info")
+    info_icon  = soup.select_one("svg.ttt1.info")
     last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
-    logger.info(f"IMO {imo} | name={name} | last_pos_utc={last_pos_utc}")
+
+    logger.info(f"VF: IMO {imo} | name={name} | last_pos_utc={last_pos_utc}")
 
     tech_data      = extract_table_data(soup, "tpt1")
     dims_data      = extract_table_data(soup, "tptfix")
@@ -273,82 +462,175 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         if match:
             draught_val = f"{match.group(1)} m"
 
-    final_static_data = {
-        "imo": imo,
-        "vessel_name": name,
-        "ship_type": static_data.get("Ship Type") or static_data.get("Ship type") or static_data.get("Type") or "",
-        "flag": (soup.select_one("div.title-flag-icon").get("title") if soup.select_one("div.title-flag-icon") else None),
-        "mmsi": mmsi,
-        "draught_m": draught_val or "",
-        "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
-        "gross_tonnage": static_data.get("Gross Tonnage"),
-        "year_of_build": static_data.get("Year of Build"),
-        "length_overall_m": static_data.get("Length Overall"),
-        "beam_m": static_data.get("Beam"),
-    }
-
     vf_lat = vf_lon = sog = cog = None
     djson_div = soup.find("div", id="djson")
     if djson_div and djson_div.has_attr("data-json"):
         try:
-            ais = json.loads(djson_div["data-json"])
+            ais    = json.loads(djson_div["data-json"])
             vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
             vf_lon = float(ais.get("ship_lon")) if ais.get("ship_lon") else None
-            sog = ais.get("ship_sog")
-            cog = ais.get("ship_cog")
-            logger.info(f"IMO {imo} | VF AIS: lat={vf_lat}, lon={vf_lon}, sog={sog}, cog={cog}")
+            sog    = ais.get("ship_sog")
+            cog    = ais.get("ship_cog")
+            logger.info(f"VF: IMO {imo} | lat={vf_lat}, lon={vf_lon}, sog={sog}, cog={cog}")
         except Exception as e:
-            logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
-
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session) if (mmsi and vf_lat) else None
-
-    use_mst = False
-    vf_age  = get_vf_age_minutes(last_pos_utc)
-    MAX_VF_AGE = 60
-
-    if mst_data:
-        vf_precision  = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
-        mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-
-        if vf_lat is None:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF has no position")
-        elif vf_age > MAX_VF_AGE:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF data is {vf_age} min old (>{MAX_VF_AGE})")
-        elif mst_precision > vf_precision:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: higher precision ({mst_precision} vs {vf_precision})")
-        else:
-            use_mst = False
-            logger.info(f"IMO {imo} | Using VF: fresher or equal precision (age={vf_age} min)")
-
-    if use_mst and mst_data:
-        lat, lon = mst_data["lat"], mst_data["lon"]
-        sog = mst_data.get("sog", sog)
-        cog = mst_data.get("cog", cog)
-        ais_source = "myshiptracking"
-    else:
-        lat, lon = vf_lat, vf_lon
-        ais_source = "vesselfinder"
-
-    logger.info(f"IMO {imo} | Final: lat={lat}, lon={lon}, sog={sog}, source={ais_source}")
+            logger.warning(f"VF: IMO {imo} | Failed to parse djson AIS data: {e}")
 
     return {
-        "found": True,
-        "destination": destination,
-        "last_pos_utc": last_pos_utc,
-        **final_static_data,
-        "lat": lat, "lon": lon, "sog": sog, "cog": cog,
-        "ais_source": ais_source,
+        "found":            True,
+        "imo":              imo,
+        "vessel_name":      name,
+        "ship_type":        static_data.get("Ship Type") or static_data.get("Ship type") or static_data.get("Type") or "",
+        "flag":             (soup.select_one("div.title-flag-icon").get("title") if soup.select_one("div.title-flag-icon") else None),
+        "mmsi":             mmsi,
+        "draught_m":        draught_val or "",
+        "deadweight_t":     static_data.get("Deadweight") or static_data.get("DWT"),
+        "gross_tonnage":    static_data.get("Gross Tonnage"),
+        "year_of_build":    static_data.get("Year of Build"),
+        "length_overall_m": static_data.get("Length Overall"),
+        "beam_m":           static_data.get("Beam"),
+        "destination":      destination,
+        "last_pos_utc":     last_pos_utc,
+        "lat":              vf_lat,
+        "lon":              vf_lon,
+        "sog":              sog,
+        "cog":              cog,
+        "ais_source":       "vesselfinder",
     }
+
+# ============================================================
+# UNIFIED VESSEL FETCH — ORCHESTRATES ALL THREE SOURCES
+# ============================================================
+
+def scrape_vessel_full(imo: str) -> Dict[str, Any]:
+    """
+    Fetch vessel data from all sources with fallback chain.
+
+    ┌──────────────────────────────────────────────────────────┐
+    │  CURRENT ORDER  (testing):   MT → VF → MST              │
+    │  PRODUCTION ORDER:           VF → MT → MST              │
+    │                                                          │
+    │  To switch to production, swap the two assignments:      │
+    │    primary_data   = scrape_mt_full(imo)          ← swap  │
+    │    secondary_data = scrape_vf_full(imo, session) ← swap  │
+    └──────────────────────────────────────────────────────────┘
+    """
+    with requests.Session() as session:
+
+        # ── SWITCH POINT ─────────────────────────────────────
+        # TEST (MT first):
+        primary_data   = scrape_mt_full(imo)           # ← SWAP WITH LINE BELOW FOR PRODUCTION
+        secondary_data = scrape_vf_full(imo, session)  # ← SWAP WITH LINE ABOVE FOR PRODUCTION
+        # ─────────────────────────────────────────────────────
+
+        # ── Decide best position source ───────────────────────
+        #
+        # Primary has position → use it directly, enrich with
+        # secondary static data if primary is missing fields.
+        #
+        # Primary failed / no position → fall through to secondary.
+        # Secondary also stale → try MST as last resort.
+
+        # Determine primary source name for logging
+        # (reflects whichever is currently first above)
+        primary_source = "marinetraffic"    # ← change to "vesselfinder" for production
+
+        primary_has_pos = (
+            primary_data is not None
+            and primary_data.get("lat") is not None
+        )
+
+        if primary_has_pos:
+            logger.info(f"IMO {imo} | Using {primary_source} position")
+            lat        = primary_data["lat"]
+            lon        = primary_data["lon"]
+            sog        = primary_data.get("sog")
+            cog        = primary_data.get("cog")
+            ais_source = primary_data.get("ais_source", primary_source)
+
+            # Enrich with secondary static data for any missing fields
+            static_base = {}
+            if secondary_data and secondary_data.get("found"):
+                static_base = secondary_data
+            base = {**static_base, **{k: v for k, v in primary_data.items() if v not in (None, "")}}
+
+        else:
+            # Primary failed — use secondary
+            logger.info(f"IMO {imo} | {primary_source} failed/no position — falling back to secondary")
+
+            if not secondary_data or not secondary_data.get("found"):
+                logger.warning(f"IMO {imo} | Both primary and secondary failed")
+                return {"found": False, "imo": imo}
+
+            vf_lat       = secondary_data.get("lat")
+            vf_lon       = secondary_data.get("lon")
+            sog          = secondary_data.get("sog")
+            cog          = secondary_data.get("cog")
+            last_pos_utc = secondary_data.get("last_pos_utc")
+            mmsi         = secondary_data.get("mmsi")
+            vf_age       = get_vf_age_minutes(last_pos_utc)
+            base         = secondary_data
+
+            # ── MST fallback if secondary also stale ──────────
+            mst_data = None
+            MAX_SECONDARY_AGE = 60
+            if mmsi and vf_lat and vf_age > MAX_SECONDARY_AGE:
+                logger.info(f"IMO {imo} | Secondary data is {vf_age}min old — trying MST")
+                mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
+
+            use_mst = False
+            if mst_data:
+                vf_precision  = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat else 0
+                mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
+                if vf_lat is None:
+                    use_mst = True
+                    logger.info(f"IMO {imo} | Using MST: secondary has no position")
+                elif vf_age > MAX_SECONDARY_AGE:
+                    use_mst = True
+                    logger.info(f"IMO {imo} | Using MST: secondary data {vf_age}min old")
+                elif mst_precision > vf_precision:
+                    use_mst = True
+                    logger.info(f"IMO {imo} | Using MST: higher precision")
+
+            if use_mst and mst_data:
+                lat        = mst_data["lat"]
+                lon        = mst_data["lon"]
+                sog        = mst_data.get("sog", sog)
+                cog        = mst_data.get("cog", cog)
+                ais_source = "myshiptracking"
+            else:
+                lat        = vf_lat
+                lon        = vf_lon
+                ais_source = secondary_data.get("ais_source", "vesselfinder")
+
+        logger.info(f"IMO {imo} | Final: lat={lat}, lon={lon}, sog={sog}, source={ais_source}")
+
+        return {
+            "found":            True,
+            "imo":              base.get("imo", imo),
+            "vessel_name":      base.get("vessel_name", ""),
+            "ship_type":        base.get("ship_type", ""),
+            "flag":             base.get("flag", ""),
+            "mmsi":             base.get("mmsi", ""),
+            "draught_m":        base.get("draught_m", ""),
+            "deadweight_t":     base.get("deadweight_t", ""),
+            "gross_tonnage":    base.get("gross_tonnage", ""),
+            "year_of_build":    base.get("year_of_build", ""),
+            "length_overall_m": base.get("length_overall_m", ""),
+            "beam_m":           base.get("beam_m", ""),
+            "destination":      base.get("destination", ""),
+            "last_pos_utc":     base.get("last_pos_utc", ""),
+            "lat":              lat,
+            "lon":              lon,
+            "sog":              sog,
+            "cog":              cog,
+            "ais_source":       ais_source,
+        }
 
 # ============================================================
 # API ENDPOINTS
 # ============================================================
 
 def _check_auth(request: Request, imo: str = ""):
-    """Shared auth check for all endpoints."""
     if API_SECRET:
         client_secret = request.headers.get("X-API-Secret", "")
         if client_secret != API_SECRET:
@@ -364,21 +646,16 @@ def ping():
 @app.get("/vessel-full/{imo}")
 def vessel_full(imo: str, request: Request):
     _check_auth(request, imo)
-
     if not validate_imo(imo):
         logger.warning(f"Invalid IMO rejected: {imo}")
         raise HTTPException(status_code=400, detail="Invalid IMO number")
-
-    with requests.Session() as session:
-        try:
-            data = scrape_vf_full(imo, session)
-        except Exception as e:
-            logger.error(f"Scrape failed for IMO {imo}: {e}", exc_info=True)
-            raise HTTPException(status_code=502, detail="Upstream scrape failed")
-
+    try:
+        data = scrape_vessel_full(imo)
+    except Exception as e:
+        logger.error(f"Scrape failed for IMO {imo}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Upstream scrape failed")
     if not data.get("found"):
         raise HTTPException(status_code=404, detail="Vessel not found")
-
     return data
 
 
@@ -388,16 +665,12 @@ def vessel_batch(body: BatchRequest, request: Request):
     Fetch multiple vessels in parallel.
     POST /vessel-batch
     Body: {"imos": ["9427079", "9437854", ...]}
-    Returns: {"results": {"9427079": {...}, "9437854": {...}}, "errors": {"bad_imo": "reason"}}
+    Returns: {"results": {...}, "errors": {...}, "total": N, "success": N, "failed": N}
     """
     _check_auth(request)
-
-    # Validate and deduplicate
-    imos = list(dict.fromkeys(body.imos))  # preserve order, remove duplicates
-
+    imos = list(dict.fromkeys(body.imos))
     if len(imos) > BATCH_MAX_IMOS:
         raise HTTPException(status_code=400, detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch")
-
     invalid = [imo for imo in imos if not validate_imo(imo)]
     if invalid:
         raise HTTPException(status_code=400, detail=f"Invalid IMOs: {', '.join(invalid)}")
@@ -407,10 +680,8 @@ def vessel_batch(body: BatchRequest, request: Request):
 
     def fetch_one(imo: str) -> tuple:
         try:
-            # Random delay 2-5s between requests to avoid rate limiting
-            time.sleep(random.uniform(2, 5))
-            with requests.Session() as session:
-                data = scrape_vf_full(imo, session)
+            time.sleep(random.uniform(2, 5))  # stagger parallel workers
+            data = scrape_vessel_full(imo)
             if not data.get("found"):
                 return imo, None, "Vessel not found"
             return imo, data, None
@@ -419,7 +690,6 @@ def vessel_batch(body: BatchRequest, request: Request):
             return imo, None, str(e)
 
     logger.info(f"Batch request: {len(imos)} vessels, {BATCH_MAX_WORKERS} workers")
-
     with ThreadPoolExecutor(max_workers=BATCH_MAX_WORKERS) as executor:
         futures = {executor.submit(fetch_one, imo): imo for imo in imos}
         for future in as_completed(futures):
@@ -430,7 +700,6 @@ def vessel_batch(body: BatchRequest, request: Request):
                 results[imo] = data
 
     logger.info(f"Batch complete: {len(results)} success, {len(errors)} errors")
-
     return {
         "results": results,
         "errors":  errors,
@@ -443,7 +712,6 @@ def vessel_batch(body: BatchRequest, request: Request):
 # ============================================================
 # SOF — STATEMENT OF FACTS GENERATOR
 # ============================================================
-
 
 DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 
@@ -459,7 +727,7 @@ class SOFRow(BaseModel):
 
 class SOFData(BaseModel):
     agent:             Optional[str] = ''
-    operation_type:    Optional[str] = 'import'  # 'import' = discharging, 'export' = loading
+    operation_type:    Optional[str] = 'import'
     vessel:            Optional[str] = ''
     port:              Optional[str] = ''
     owners:            Optional[str] = ''
@@ -519,7 +787,6 @@ async def get_sof_template() -> bytes:
     global SOF_TEMPLATE_BYTES
     if SOF_TEMPLATE_BYTES:
         return SOF_TEMPLATE_BYTES
-    # Fetch template from GitHub Pages
     url = 'https://asmahri2-afk.github.io/test/SOF_TEMPLATE.xlsx'
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url)
@@ -531,49 +798,41 @@ async def get_sof_template() -> bytes:
 
 @app.post('/sof/generate')
 async def sof_generate(data: SOFData, request: Request):
-    # Auth check
     if API_SECRET:
         client_secret = request.headers.get('X-API-Secret', '')
         if client_secret != API_SECRET:
             raise HTTPException(status_code=401, detail='Unauthorized')
-
     try:
         template_bytes = await get_sof_template()
         wb = load_workbook(io.BytesIO(template_bytes))
         ws = wb.active
-
-        # Operation verb: import = discharging, export = loading
         operation_verb = 'loading' if (data.operation_type or '').lower() == 'export' else 'discharging'
-
-        # Build tag → value map
         tag_values = {
-            '{{AGENT}}':          data.agent or '',
-            '{{VESSEL_NAME}}':    data.vessel or '',
-            '{{PORT}}':           data.port or '',
-            '{{OWNERS}}':         data.owners or '',
-            '{{CARGO}}':          data.cargo or '',
-            '{{BL_WEIGHT}}':      data.bl_weight or '',
-            '{{BL_NUMBER}}':      data.bl_number or '',
-            '{{PORT_HOURS}}':     data.port_hours or '',
+            '{{AGENT}}':           data.agent or '',
+            '{{VESSEL_NAME}}':     data.vessel or '',
+            '{{PORT}}':            data.port or '',
+            '{{OWNERS}}':          data.owners or '',
+            '{{CARGO}}':           data.cargo or '',
+            '{{BL_WEIGHT}}':       data.bl_weight or '',
+            '{{BL_NUMBER}}':       data.bl_number or '',
+            '{{PORT_HOURS}}':      data.port_hours or '',
             '{{GENERAL_REMARKS}}': data.general_remarks or '',
-            '{{REMARKS}}':        data.remarks or '',
-            '{{MASTER_REMARKS}}': data.master_remarks or '',
-            '{{NOR_ACCEPTED}}':   data.nor_accepted or '',
-            '{{OPERATION_VERB}}': operation_verb,
-            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':         fmt_dt(data.berthed_date, data.berthed_time),
-            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr': fmt_dt(data.disch_start_date, data.disch_start_time),
-            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':     fmt_dt(data.disch_end_date, data.disch_end_time),
-            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':   fmt_dt(data.cargo_docs_date, data.cargo_docs_time),
-            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':         fmt_dt(data.sailing_date, data.sailing_time),
-            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':               fmt_dt(data.eosp_date, data.eosp_time),
-            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':   fmt_dt(data.nor_tender_date, data.nor_tender_time),
-            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr': fmt_dt(data.anchor_drop_date, data.anchor_drop_time),
+            '{{REMARKS}}':         data.remarks or '',
+            '{{MASTER_REMARKS}}':  data.master_remarks or '',
+            '{{NOR_ACCEPTED}}':    data.nor_accepted or '',
+            '{{OPERATION_VERB}}':  operation_verb,
+            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':           fmt_dt(data.berthed_date, data.berthed_time),
+            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr':   fmt_dt(data.disch_start_date, data.disch_start_time),
+            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':       fmt_dt(data.disch_end_date, data.disch_end_time),
+            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':     fmt_dt(data.cargo_docs_date, data.cargo_docs_time),
+            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':           fmt_dt(data.sailing_date, data.sailing_time),
+            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':                 fmt_dt(data.eosp_date, data.eosp_time),
+            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':     fmt_dt(data.nor_tender_date, data.nor_tender_time),
+            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr':   fmt_dt(data.anchor_drop_date, data.anchor_drop_time),
             '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
-            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':             fmt_dt(data.pilot_date, data.pilot_time),
+            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':               fmt_dt(data.pilot_date, data.pilot_time),
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
         }
-
-        # Replace all tags preserving cell styles
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value and isinstance(cell.value, str):
@@ -583,7 +842,6 @@ async def sof_generate(data: SOFData, request: Request):
                             val = val.replace(tag, replacement)
                     cell.value = val
 
-        # Handle dynamic ops rows
         marker_row = template_row = end_row = None
         for row in ws.iter_rows():
             for cell in row:
@@ -592,7 +850,6 @@ async def sof_generate(data: SOFData, request: Request):
                 elif cell.value == '{{/EACH_ROW}}':  end_row = cell.row
 
         if marker_row and template_row and data.rows:
-            # Capture template row styles before clearing
             tpl_styles = {}
             for col in range(1, 12):
                 c = ws.cell(row=template_row, column=col)
@@ -602,24 +859,20 @@ async def sof_generate(data: SOFData, request: Request):
                     'fill':      copy(c.fill),
                     'alignment': copy(c.alignment),
                 }
-
-            # Clear marker/template/end rows
             for r in filter(None, [marker_row, template_row, end_row]):
                 for col in range(1, 12):
                     ws.cell(row=r, column=col).value = None
-
-            # Write data rows
             for i, row_data in enumerate(data.rows):
                 r = marker_row + i
                 values = [
                     fmt_dt(row_data.date, '').split(' ')[0] if row_data.date else '',
                     get_day_name(row_data.date),
-                    row_data.wfrom.replace(':','') if row_data.wfrom else '',
-                    row_data.wto.replace(':','') if row_data.wto else '',
-                    row_data.sfrom.replace(':','') if row_data.sfrom else '',
-                    row_data.sto.replace(':','') if row_data.sto else '',
-                    row_data.cranes or '',
-                    row_data.qty or '',
+                    row_data.wfrom.replace(':', '') if row_data.wfrom else '',
+                    row_data.wto.replace(':', '')   if row_data.wto   else '',
+                    row_data.sfrom.replace(':', '') if row_data.sfrom else '',
+                    row_data.sto.replace(':', '')   if row_data.sto   else '',
+                    row_data.cranes  or '',
+                    row_data.qty     or '',
                     '',
                     row_data.remarks or '',
                     '',
@@ -628,13 +881,11 @@ async def sof_generate(data: SOFData, request: Request):
                     cell = ws.cell(row=r, column=col)
                     cell.value = val if val else None
                     s = tpl_styles.get(col, {})
-                    if s.get('font'):      cell.font = s['font']
-                    if s.get('border'):    cell.border = s['border']
-                    if s.get('fill'):      cell.fill = s['fill']
+                    if s.get('font'):      cell.font      = s['font']
+                    if s.get('border'):    cell.border    = s['border']
+                    if s.get('fill'):      cell.fill      = s['fill']
                     if s.get('alignment'): cell.alignment = s['alignment']
 
-        # ── Logo swap ─────────────────────────────────────────────────────────
-        # If agent is COMANAV, replace CMA CGM logo with COMANAV logo
         if (data.agent or '').upper() == 'COMANAV' and ws._images:
             try:
                 comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
@@ -642,31 +893,24 @@ async def sof_generate(data: SOFData, request: Request):
                     logo_resp = await client.get(comanav_url)
                     logo_resp.raise_for_status()
                     logo_bytes = logo_resp.content
-
-                # Swap image data directly on existing image object
-                # This preserves anchor, size and all positioning
                 old_img = ws._images[0]
                 old_img.ref = io.BytesIO(logo_bytes)
                 logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
             except Exception as e:
                 logger.warning(f"Logo swap failed (non-critical): {type(e).__name__}: {e}", exc_info=True)
 
-        # Save to buffer
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
-
-        vessel = (data.vessel or 'VESSEL').replace(' ', '_')
-        port = (data.port or 'PORT').replace(' ', '_')
+        vessel   = (data.vessel or 'VESSEL').replace(' ', '_')
+        port     = (data.port   or 'PORT').replace(' ', '_')
         date_str = datetime.now().strftime('%Y%m%d')
         filename = f"SOF_{vessel}_{port}_{date_str}.xlsx"
-
         return Response(
             content=buf.read(),
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
             headers={'Content-Disposition': f'attachment; filename="{filename}"'}
         )
-
     except Exception as e:
         logger.error(f"SOF generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"SOF generation failed: {str(e)}")

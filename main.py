@@ -57,7 +57,9 @@ HEADERS = _make_headers()
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
 
-API_SECRET  = os.getenv("API_SECRET", "")
+API_SECRET         = os.getenv("API_SECRET", "")
+EQUASIS_EMAIL      = os.getenv("EQUASIS_EMAIL", "")
+EQUASIS_PASSWORD   = os.getenv("EQUASIS_PASSWORD", "")
 
 # Max parallel workers for batch — keep low to avoid hammering VesselFinder
 BATCH_MAX_WORKERS = 2  # Reduced from 4 — fewer parallel requests reduces bot detection risk
@@ -439,6 +441,182 @@ def vessel_batch(body: BatchRequest, request: Request):
         "success": len(results),
         "failed":  len(errors),
     }
+
+
+# ============================================================
+# EQUASIS SCRAPER
+# ============================================================
+
+EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
+EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
+
+def _equasis_session() -> requests.Session:
+    """Log in to Equasis and return an authenticated session."""
+    if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
+        raise HTTPException(status_code=503, detail="Equasis credentials not configured")
+
+    session = requests.Session()
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Referer": EQUASIS_LOGIN_URL,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    r = session.post(
+        EQUASIS_LOGIN_URL,
+        data={"j_email": EQUASIS_EMAIL, "j_password": EQUASIS_PASSWORD, "submit": "Login"},
+        headers=headers,
+        timeout=15,
+        allow_redirects=True,
+    )
+    r.raise_for_status()
+
+    # If still on login page — bad credentials
+    if "j_password" in r.text or "invalid" in r.text.lower() and "password" in r.text.lower():
+        raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
+
+    return session
+
+
+def scrape_equasis(imo: str) -> Dict[str, Any]:
+    session = _equasis_session()
+
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Referer": EQUASIS_LOGIN_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    r = session.get(
+        EQUASIS_VESSEL_URL,
+        params={"fs": "Search", "P_IMO": imo},
+        headers=headers,
+        timeout=15,
+    )
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ", strip=True)
+
+    # ── Vessel not found ─────────────────────────────────────────────────────
+    if "no vessel found" in text.lower() or "not found" in text.lower():
+        return {"found": False, "imo": imo}
+
+    result: Dict[str, Any] = {"imo": imo, "found": True}
+
+    # ── Helper: scrape all label→value pairs from all tables ─────────────────
+    def parse_tables(soup_obj):
+        pairs = {}
+        for table in soup_obj.find_all("table"):
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                for i in range(len(cells) - 1):
+                    label = cells[i].get_text(" ", strip=True).rstrip(":").strip()
+                    value = cells[i + 1].get_text(" ", strip=True).strip()
+                    if label and value and len(label) < 60:
+                        pairs[label] = value
+        return pairs
+
+    pairs = parse_tables(soup)
+
+    # ── Vessel name ───────────────────────────────────────────────────────────
+    for sel in ["h1", "h2", ".ship-name", ".title", "#shipName"]:
+        el = soup.select_one(sel)
+        if el:
+            name = el.get_text(strip=True)
+            if name and len(name) > 2:
+                result["vessel_name"] = name
+                break
+
+    # ── Ship particulars — map known Equasis labels ───────────────────────────
+    FIELD_MAP = {
+        "vessel_name":   ["Ship name", "Name", "Vessel name"],
+        "Flag":          ["Flag", "Flag State", "Flag state"],
+        "Type of ship":  ["Type of ship", "Ship type", "Type"],
+        "MMSI":          ["MMSI"],
+        "Call Sign":     ["Call sign", "Call Sign", "Callsign"],
+        "Gross tonnage": ["Gross tonnage", "GT", "Gross Tonnage"],
+        "DWT":           ["Deadweight", "DWT", "Deadweight (t)"],
+        "Year of build": ["Year of build", "Built", "Year built", "Year of Build"],
+        "Status":        ["Status", "Ship status"],
+        "IMO":           ["IMO number", "IMO No", "IMO"],
+    }
+    for out_key, candidates in FIELD_MAP.items():
+        for candidate in candidates:
+            if candidate in pairs and pairs[candidate]:
+                result[out_key] = pairs[candidate]
+                break
+
+    # ── Company section — owner, P&I, class ──────────────────────────────────
+    # Equasis renders company associations in a separate table section.
+    # Strategy: find all rows where the first cell contains a company role keyword.
+    OWNER_KEYWORDS   = ["registered owner", "owner"]
+    PI_KEYWORDS      = ["p&i club", "p & i", "protection", "p and i"]
+    CLASS_KEYWORDS   = ["class", "classification"]
+
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            role = cells[0].get_text(" ", strip=True).lower()
+            company_name = cells[1].get_text(" ", strip=True)
+
+            # Address is often in a 3rd cell or next row
+            address = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
+
+            if any(k in role for k in OWNER_KEYWORDS) and company_name:
+                if "equasis_owner" not in result:
+                    result["equasis_owner"] = company_name
+                    if address:
+                        result["equasis_address"] = address
+
+            elif any(k in role for k in PI_KEYWORDS) and company_name:
+                if "pi_club" not in result:
+                    result["pi_club"] = company_name
+
+            elif any(k in role for k in CLASS_KEYWORDS) and company_name:
+                if "class_society" not in result:
+                    result["class_society"] = company_name
+
+    # ── Fallback: regex scan full text for owner if table parsing missed it ──
+    if "equasis_owner" not in result:
+        m = re.search(r"Registered\s+owner\s*[:\-]?\s*([A-Z][^\n\r]{3,80})", text, re.IGNORECASE)
+        if m:
+            result["equasis_owner"] = m.group(1).strip()
+
+    logger.info(
+        f"IMO {imo} | Equasis: name={result.get('vessel_name')} "
+        f"owner={result.get('equasis_owner')} flag={result.get('Flag')}"
+    )
+    return result
+
+
+@app.get("/equasis/{imo}")
+def equasis_vessel(imo: str, request: Request):
+    _check_auth(request, imo)
+
+    if not validate_imo(imo):
+        logger.warning(f"Equasis: invalid IMO rejected: {imo}")
+        raise HTTPException(status_code=400, detail="Invalid IMO number")
+
+    try:
+        data = scrape_equasis(imo)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Equasis scrape failed for IMO {imo}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Equasis scrape failed: {str(e)}")
+
+    if not data.get("found"):
+        raise HTTPException(status_code=404, detail="Vessel not found on Equasis")
+
+    return data
 
 
 # ============================================================

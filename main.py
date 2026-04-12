@@ -1,4 +1,3 @@
-# (Full file unchanged – provided for completeness)
 import json
 import time
 import logging
@@ -429,7 +428,7 @@ def vessel_batch(body: BatchRequest, request: Request):
     }
 
 # ============================================================
-# EQUASIS SCRAPER
+# EQUASIS SCRAPER (IMPROVED)
 # ============================================================
 
 EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
@@ -457,7 +456,7 @@ def _equasis_session() -> requests.Session:
     )
     r.raise_for_status()
 
-    if "j_password" in r.text or "invalid" in r.text.lower() and "password" in r.text.lower():
+    if "j_password" in r.text or ("invalid" in r.text.lower() and "password" in r.text.lower()):
         raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
 
     return session
@@ -488,80 +487,103 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {"imo": imo, "found": True}
 
-    def parse_tables(soup_obj):
-        pairs = {}
-        for table in soup_obj.find_all("table"):
-            rows = table.find_all("tr")
-            for row in rows:
-                cells = row.find_all(["td", "th"])
-                for i in range(len(cells) - 1):
-                    label = cells[i].get_text(" ", strip=True).rstrip(":").strip()
-                    value = cells[i + 1].get_text(" ", strip=True).strip()
-                    if label and value and len(label) < 60:
-                        pairs[label] = value
-        return pairs
+    # ── Vessel name ───────────────────────────────────────────────────────────
+    name_header = soup.find("h4", class_="color-gris-bleu-copyright")
+    if name_header:
+        name_b = name_header.find("b")
+        if name_b:
+            result["vessel_name"] = name_b.get_text(strip=True)
 
-    pairs = parse_tables(soup)
+    # ── Ship particulars (div.row based) ──────────────────────────────────────
+    # Locate the container that holds the ship info rows.
+    info_container = None
+    for access_item in soup.find_all("div", class_="access-item"):
+        rows = access_item.find_all("div", class_="row")
+        if any("Flag" in row.get_text() for row in rows):
+            info_container = access_item
+            break
 
-    for sel in ["h1", "h2", ".ship-name", ".title", "#shipName"]:
-        el = soup.select_one(sel)
-        if el:
-            name = el.get_text(strip=True)
-            if name and len(name) > 2:
-                result["vessel_name"] = name
-                break
-
-    FIELD_MAP = {
-        "vessel_name":   ["Ship name", "Name", "Vessel name"],
-        "Flag":          ["Flag", "Flag State", "Flag state"],
-        "Type of ship":  ["Type of ship", "Ship type", "Type"],
-        "MMSI":          ["MMSI"],
-        "Call Sign":     ["Call sign", "Call Sign", "Callsign"],
-        "Gross tonnage": ["Gross tonnage", "GT", "Gross Tonnage"],
-        "DWT":           ["Deadweight", "DWT", "Deadweight (t)"],
-        "Year of build": ["Year of build", "Built", "Year built", "Year of Build"],
-        "Status":        ["Status", "Ship status"],
-        "IMO":           ["IMO number", "IMO No", "IMO"],
-    }
-    for out_key, candidates in FIELD_MAP.items():
-        for candidate in candidates:
-            if candidate in pairs and pairs[candidate]:
-                result[out_key] = pairs[candidate]
-                break
-
-    OWNER_KEYWORDS   = ["registered owner", "owner"]
-    PI_KEYWORDS      = ["p&i club", "p & i", "protection", "p and i"]
-    CLASS_KEYWORDS   = ["class", "classification"]
-
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
+    if info_container:
+        rows = info_container.find_all("div", class_="row")
         for row in rows:
-            cells = row.find_all(["td", "th"])
-            if len(cells) < 2:
+            cols = row.find_all("div", class_=re.compile(r"col-(lg|md|sm|xs)-\d+"))
+            if len(cols) < 2:
                 continue
-            role = cells[0].get_text(" ", strip=True).lower()
-            company_name = cells[1].get_text(" ", strip=True)
+            label = cols[0].get_text(" ", strip=True).rstrip(":").strip()
+            value_col = cols[1]
+            value_text = value_col.get_text(" ", strip=True)
 
-            address = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
+            # For flag, the country name is often in parentheses in the third column
+            if "Flag" in label:
+                flag_match = re.search(r"\(([^)]+)\)", row.get_text())
+                if flag_match:
+                    value_text = flag_match.group(1)
+                else:
+                    value_text = value_text or ""
 
-            if any(k in role for k in OWNER_KEYWORDS) and company_name:
-                if "equasis_owner" not in result:
-                    result["equasis_owner"] = company_name
-                    if address:
-                        result["equasis_address"] = address
+            if label and value_text:
+                if "Flag" in label:
+                    result["Flag"] = value_text
+                elif "Call Sign" in label:
+                    result["Call Sign"] = value_text
+                elif "MMSI" in label:
+                    result["MMSI"] = value_text
+                elif "Gross tonnage" in label:
+                    result["Gross tonnage"] = value_text
+                elif "DWT" in label:
+                    result["DWT"] = value_text
+                elif "Type of ship" in label:
+                    result["Type of ship"] = value_text
+                elif "Year of build" in label:
+                    result["Year of build"] = value_text
+                elif "Status" in label:
+                    result["Status"] = value_text
 
-            elif any(k in role for k in PI_KEYWORDS) and company_name:
-                if "pi_club" not in result:
-                    result["pi_club"] = company_name
+    # Fallback for name
+    if "vessel_name" not in result:
+        h1 = soup.find("h1")
+        if h1:
+            result["vessel_name"] = h1.get_text(strip=True)
 
-            elif any(k in role for k in CLASS_KEYWORDS) and company_name:
-                if "class_society" not in result:
-                    result["class_society"] = company_name
+    # ── Management detail (owner, address) ────────────────────────────────────
+    mgt_table = soup.find("table", class_="tableLS")
+    if mgt_table:
+        rows = mgt_table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) >= 4:
+                role = cells[1].get_text(strip=True).lower()
+                if "registered owner" in role:
+                    owner_name = cells[2].get_text(strip=True)
+                    owner_address = cells[3].get_text(strip=True)
+                    result["equasis_owner"] = owner_name
+                    result["equasis_address"] = owner_address
+                    break
 
     if "equasis_owner" not in result:
         m = re.search(r"Registered\s+owner\s*[:\-]?\s*([A-Z][^\n\r]{3,80})", text, re.IGNORECASE)
         if m:
             result["equasis_owner"] = m.group(1).strip()
+
+    # ── P&I Information ───────────────────────────────────────────────────────
+    pi_section = soup.find("h3", string=re.compile(r"P&I Information", re.I))
+    if pi_section:
+        parent = pi_section.find_parent("div", class_="cadre")
+        if parent:
+            club_el = parent.find("p")
+            if club_el:
+                result["pi_club"] = club_el.get_text(strip=True)
+
+    # ── Classification society ────────────────────────────────────────────────
+    class_section = soup.find("h3", string=re.compile(r"Classification", re.I))
+    if class_section:
+        parent = class_section.find_parent("div", class_="cadre")
+        if parent:
+            for p in parent.find_all("p"):
+                txt = p.get_text(strip=True)
+                if "Register" in txt or "Class" in txt:
+                    result["class_society"] = txt
+                    break
 
     logger.info(
         f"IMO {imo} | Equasis: name={result.get('vessel_name')} "
@@ -589,6 +611,13 @@ def equasis_vessel(imo: str, request: Request):
         raise HTTPException(status_code=404, detail="Vessel not found on Equasis")
 
     return data
+
+# ============================================================
+# SOF — STATEMENT OF FACTS GENERATOR
+# ============================================================
+
+# (SOF code unchanged from your original – omitted for brevity)
+# ... (include your existing SOF endpoints and classes here)
 
 # ============================================================
 # SOF — STATEMENT OF FACTS GENERATOR

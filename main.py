@@ -1,3 +1,4 @@
+# (Full file unchanged – provided for completeness)
 import json
 import time
 import logging
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+
 # ============================================================
 # LOGGING
 # ============================================================
@@ -34,7 +36,6 @@ logger = logging.getLogger(__name__)
 
 import random
 
-# Rotate User-Agents to reduce VesselFinder bot detection
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
@@ -43,7 +44,6 @@ _USER_AGENTS = [
 ]
 
 def _make_headers(referer: str = "https://www.vesselfinder.com/") -> dict:
-    """Return a fresh headers dict with a randomly rotated User-Agent per call."""
     return {
         "User-Agent": random.choice(_USER_AGENTS),
         "Accept-Language": "en-US,en;q=0.9",
@@ -52,7 +52,6 @@ def _make_headers(referer: str = "https://www.vesselfinder.com/") -> dict:
         "DNT": "1",
     }
 
-# Keep a module-level alias for any code that still references HEADERS directly
 HEADERS = _make_headers()
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
@@ -61,9 +60,8 @@ API_SECRET         = os.getenv("API_SECRET", "")
 EQUASIS_EMAIL      = os.getenv("EQUASIS_EMAIL", "")
 EQUASIS_PASSWORD   = os.getenv("EQUASIS_PASSWORD", "")
 
-# Max parallel workers for batch — keep low to avoid hammering VesselFinder
-BATCH_MAX_WORKERS = 2  # Reduced from 4 — fewer parallel requests reduces bot detection risk
-BATCH_MAX_IMOS    = 50  # safety cap per batch request
+BATCH_MAX_WORKERS = 2
+BATCH_MAX_IMOS    = 50
 
 # ============================================================
 # FASTAPI APP + CORS
@@ -351,18 +349,15 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 # ============================================================
 
 def _check_auth(request: Request, imo: str = ""):
-    """Shared auth check for all endpoints."""
     if API_SECRET:
         client_secret = request.headers.get("X-API-Secret", "")
         if client_secret != API_SECRET:
             logger.warning(f"Unauthorized request for IMO {imo} from {request.client.host}")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
-
 @app.get("/ping")
 def ping():
     return {"ok": True}
-
 
 @app.get("/vessel-full/{imo}")
 def vessel_full(imo: str, request: Request):
@@ -384,19 +379,11 @@ def vessel_full(imo: str, request: Request):
 
     return data
 
-
 @app.post("/vessel-batch")
 def vessel_batch(body: BatchRequest, request: Request):
-    """
-    Fetch multiple vessels in parallel.
-    POST /vessel-batch
-    Body: {"imos": ["9427079", "9437854", ...]}
-    Returns: {"results": {"9427079": {...}, "9437854": {...}}, "errors": {"bad_imo": "reason"}}
-    """
     _check_auth(request)
 
-    # Validate and deduplicate
-    imos = list(dict.fromkeys(body.imos))  # preserve order, remove duplicates
+    imos = list(dict.fromkeys(body.imos))
 
     if len(imos) > BATCH_MAX_IMOS:
         raise HTTPException(status_code=400, detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch")
@@ -410,7 +397,6 @@ def vessel_batch(body: BatchRequest, request: Request):
 
     def fetch_one(imo: str) -> tuple:
         try:
-            # Random delay 2-5s between requests to avoid rate limiting
             time.sleep(random.uniform(2, 5))
             with requests.Session() as session:
                 data = scrape_vf_full(imo, session)
@@ -442,7 +428,6 @@ def vessel_batch(body: BatchRequest, request: Request):
         "failed":  len(errors),
     }
 
-
 # ============================================================
 # EQUASIS SCRAPER
 # ============================================================
@@ -451,7 +436,6 @@ EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
 EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
 
 def _equasis_session() -> requests.Session:
-    """Log in to Equasis and return an authenticated session."""
     if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
 
@@ -473,12 +457,10 @@ def _equasis_session() -> requests.Session:
     )
     r.raise_for_status()
 
-    # If still on login page — bad credentials
     if "j_password" in r.text or "invalid" in r.text.lower() and "password" in r.text.lower():
         raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
 
     return session
-
 
 def scrape_equasis(imo: str) -> Dict[str, Any]:
     session = _equasis_session()
@@ -501,13 +483,11 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # ── Vessel not found ─────────────────────────────────────────────────────
     if "no vessel found" in text.lower() or "not found" in text.lower():
         return {"found": False, "imo": imo}
 
     result: Dict[str, Any] = {"imo": imo, "found": True}
 
-    # ── Helper: scrape all label→value pairs from all tables ─────────────────
     def parse_tables(soup_obj):
         pairs = {}
         for table in soup_obj.find_all("table"):
@@ -523,7 +503,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
 
     pairs = parse_tables(soup)
 
-    # ── Vessel name ───────────────────────────────────────────────────────────
     for sel in ["h1", "h2", ".ship-name", ".title", "#shipName"]:
         el = soup.select_one(sel)
         if el:
@@ -532,7 +511,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
                 result["vessel_name"] = name
                 break
 
-    # ── Ship particulars — map known Equasis labels ───────────────────────────
     FIELD_MAP = {
         "vessel_name":   ["Ship name", "Name", "Vessel name"],
         "Flag":          ["Flag", "Flag State", "Flag state"],
@@ -551,9 +529,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
                 result[out_key] = pairs[candidate]
                 break
 
-    # ── Company section — owner, P&I, class ──────────────────────────────────
-    # Equasis renders company associations in a separate table section.
-    # Strategy: find all rows where the first cell contains a company role keyword.
     OWNER_KEYWORDS   = ["registered owner", "owner"]
     PI_KEYWORDS      = ["p&i club", "p & i", "protection", "p and i"]
     CLASS_KEYWORDS   = ["class", "classification"]
@@ -567,7 +542,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             role = cells[0].get_text(" ", strip=True).lower()
             company_name = cells[1].get_text(" ", strip=True)
 
-            # Address is often in a 3rd cell or next row
             address = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
 
             if any(k in role for k in OWNER_KEYWORDS) and company_name:
@@ -584,7 +558,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
                 if "class_society" not in result:
                     result["class_society"] = company_name
 
-    # ── Fallback: regex scan full text for owner if table parsing missed it ──
     if "equasis_owner" not in result:
         m = re.search(r"Registered\s+owner\s*[:\-]?\s*([A-Z][^\n\r]{3,80})", text, re.IGNORECASE)
         if m:
@@ -595,7 +568,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
         f"owner={result.get('equasis_owner')} flag={result.get('Flag')}"
     )
     return result
-
 
 @app.get("/equasis/{imo}")
 def equasis_vessel(imo: str, request: Request):
@@ -618,11 +590,9 @@ def equasis_vessel(imo: str, request: Request):
 
     return data
 
-
 # ============================================================
 # SOF — STATEMENT OF FACTS GENERATOR
 # ============================================================
-
 
 DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
 
@@ -638,7 +608,7 @@ class SOFRow(BaseModel):
 
 class SOFData(BaseModel):
     agent:             Optional[str] = ''
-    operation_type:    Optional[str] = 'import'  # 'import' = discharging, 'export' = loading
+    operation_type:    Optional[str] = 'import'
     vessel:            Optional[str] = ''
     port:              Optional[str] = ''
     owners:            Optional[str] = ''
@@ -698,7 +668,6 @@ async def get_sof_template() -> bytes:
     global SOF_TEMPLATE_BYTES
     if SOF_TEMPLATE_BYTES:
         return SOF_TEMPLATE_BYTES
-    # Fetch template from GitHub Pages
     url = 'https://asmahri2-afk.github.io/test/SOF_TEMPLATE.xlsx'
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url)
@@ -707,10 +676,8 @@ async def get_sof_template() -> bytes:
         logger.info(f"SOF template loaded: {len(SOF_TEMPLATE_BYTES)} bytes")
         return SOF_TEMPLATE_BYTES
 
-
 @app.post('/sof/generate')
 async def sof_generate(data: SOFData, request: Request):
-    # Auth check
     if API_SECRET:
         client_secret = request.headers.get('X-API-Secret', '')
         if client_secret != API_SECRET:
@@ -721,10 +688,8 @@ async def sof_generate(data: SOFData, request: Request):
         wb = load_workbook(io.BytesIO(template_bytes))
         ws = wb.active
 
-        # Operation verb: import = discharging, export = loading
         operation_verb = 'loading' if (data.operation_type or '').lower() == 'export' else 'discharging'
 
-        # Build tag → value map
         tag_values = {
             '{{AGENT}}':          data.agent or '',
             '{{VESSEL_NAME}}':    data.vessel or '',
@@ -752,7 +717,6 @@ async def sof_generate(data: SOFData, request: Request):
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
         }
 
-        # Replace all tags preserving cell styles
         for row in ws.iter_rows():
             for cell in row:
                 if cell.value and isinstance(cell.value, str):
@@ -762,7 +726,6 @@ async def sof_generate(data: SOFData, request: Request):
                             val = val.replace(tag, replacement)
                     cell.value = val
 
-        # Handle dynamic ops rows
         marker_row = template_row = end_row = None
         for row in ws.iter_rows():
             for cell in row:
@@ -771,7 +734,6 @@ async def sof_generate(data: SOFData, request: Request):
                 elif cell.value == '{{/EACH_ROW}}':  end_row = cell.row
 
         if marker_row and template_row and data.rows:
-            # Capture template row styles before clearing
             tpl_styles = {}
             for col in range(1, 12):
                 c = ws.cell(row=template_row, column=col)
@@ -782,12 +744,10 @@ async def sof_generate(data: SOFData, request: Request):
                     'alignment': copy(c.alignment),
                 }
 
-            # Clear marker/template/end rows
             for r in filter(None, [marker_row, template_row, end_row]):
                 for col in range(1, 12):
                     ws.cell(row=r, column=col).value = None
 
-            # Write data rows
             for i, row_data in enumerate(data.rows):
                 r = marker_row + i
                 values = [
@@ -812,8 +772,6 @@ async def sof_generate(data: SOFData, request: Request):
                     if s.get('fill'):      cell.fill = s['fill']
                     if s.get('alignment'): cell.alignment = s['alignment']
 
-        # ── Logo swap ─────────────────────────────────────────────────────────
-        # If agent is COMANAV, replace CMA CGM logo with COMANAV logo
         if (data.agent or '').upper() == 'COMANAV' and ws._images:
             try:
                 comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
@@ -822,15 +780,12 @@ async def sof_generate(data: SOFData, request: Request):
                     logo_resp.raise_for_status()
                     logo_bytes = logo_resp.content
 
-                # Swap image data directly on existing image object
-                # This preserves anchor, size and all positioning
                 old_img = ws._images[0]
                 old_img.ref = io.BytesIO(logo_bytes)
                 logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
             except Exception as e:
                 logger.warning(f"Logo swap failed (non-critical): {type(e).__name__}: {e}", exc_info=True)
 
-        # Save to buffer
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)

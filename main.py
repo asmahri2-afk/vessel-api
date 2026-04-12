@@ -447,66 +447,53 @@ def vessel_batch(body: BatchRequest, request: Request):
 # EQUASIS SCRAPER
 # ============================================================
 
-EQUASIS_BASE = "https://www.equasis.org/EquasisWeb"
-
+EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
+EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
 
 def _equasis_session() -> requests.Session:
-    """Open Equasis login page then POST credentials — mirrors the working test script."""
+    """Log in to Equasis and return an authenticated session."""
     if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
 
     session = requests.Session()
-    session.headers.update({
-        "User-Agent":      random.choice(_USER_AGENTS),
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Referer": EQUASIS_LOGIN_URL,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
+    }
 
-    # Step 1: GET login page to grab session cookie
-    session.get(f"{EQUASIS_BASE}/public/Login", timeout=15)
-
-    # Step 2: POST credentials
     r = session.post(
-        f"{EQUASIS_BASE}/authen/HomePage?fs=HomePage",
-        data={
-            "j_email":    EQUASIS_EMAIL,
-            "j_password": EQUASIS_PASSWORD,
-            "submit":     "Login",
-        },
+        EQUASIS_LOGIN_URL,
+        data={"j_email": EQUASIS_EMAIL, "j_password": EQUASIS_PASSWORD, "submit": "Login"},
+        headers=headers,
         timeout=15,
+        allow_redirects=True,
     )
     r.raise_for_status()
 
-    ok = "logout" in r.text.lower() or EQUASIS_EMAIL.split("@")[0].lower() in r.text.lower()
-    if not ok:
-        logger.error("Equasis login failed — check EQUASIS_EMAIL / EQUASIS_PASSWORD env vars")
+    # If still on login page — bad credentials
+    if "j_password" in r.text or "invalid" in r.text.lower() and "password" in r.text.lower():
         raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
 
-    logger.info("Equasis login successful")
     return session
 
 
 def scrape_equasis(imo: str) -> Dict[str, Any]:
     session = _equasis_session()
 
-    # Step 1: POST search to set session context (required by Equasis)
-    session.post(
-        f"{EQUASIS_BASE}/restricted/Search?fs=Search",
-        data={
-            "P_ENTREE_HOME_HIDDEN": imo,
-            "P_PAGE":               "1",
-            "P_PAGE_COMP":          "1",
-            "P_PAGE_SHIP":          "1",
-            "ongletActifSC":        "ship",
-            "checkbox-shipSearch":  "Ship",
-        },
-        timeout=15,
-    )
+    headers = {
+        "User-Agent": random.choice(_USER_AGENTS),
+        "Referer": EQUASIS_LOGIN_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-    # Step 2: POST to ShipInfo to get vessel detail page
-    r = session.post(
-        f"{EQUASIS_BASE}/restricted/ShipInfo?fs=Search",
-        data={"P_IMO": imo},
+    r = session.get(
+        EQUASIS_VESSEL_URL,
+        params={"fs": "Search", "P_IMO": imo},
+        headers=headers,
         timeout=15,
     )
     r.raise_for_status()
@@ -514,39 +501,49 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    if "no vessel found" in text.lower():
+    # ── Vessel not found ─────────────────────────────────────────────────────
+    if "no vessel found" in text.lower() or "not found" in text.lower():
         return {"found": False, "imo": imo}
 
     result: Dict[str, Any] = {"imo": imo, "found": True}
 
-    # ── Vessel name: h4.color-gris-bleu-copyright b ───────────────────────────
-    h4 = soup.select_one("h4.color-gris-bleu-copyright b")
-    if h4:
-        result["vessel_name"] = h4.get_text(strip=True)
+    # ── Helper: scrape all label→value pairs from all tables ─────────────────
+    def parse_tables(soup_obj):
+        pairs = {}
+        for table in soup_obj.find_all("table"):
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all(["td", "th"])
+                for i in range(len(cells) - 1):
+                    label = cells[i].get_text(" ", strip=True).rstrip(":").strip()
+                    value = cells[i + 1].get_text(" ", strip=True).strip()
+                    if label and value and len(label) < 60:
+                        pairs[label] = value
+        return pairs
 
-    # ── Ship particulars: div.row → col-lg-4 label/value pairs ───────────────
-    # Flag row is special: col[1] is an <img> with no text, col[2] is "(Morocco)"
-    pairs: Dict[str, str] = {}
-    for row in soup.select("div.row"):
-        cols = row.select("div[class*='col-lg-4']")
-        if len(cols) >= 2:
-            label = cols[0].get_text(strip=True).rstrip(":").strip()
-            value = cols[1].get_text(strip=True)
-            # If value is empty (e.g. flag row has an img in col[1]), try col[2]
-            if not value and len(cols) >= 3:
-                value = cols[2].get_text(strip=True).strip("()").strip()
-            if label and value and len(label) < 40:
-                pairs[label] = value
+    pairs = parse_tables(soup)
 
+    # ── Vessel name ───────────────────────────────────────────────────────────
+    for sel in ["h1", "h2", ".ship-name", ".title", "#shipName"]:
+        el = soup.select_one(sel)
+        if el:
+            name = el.get_text(strip=True)
+            if name and len(name) > 2:
+                result["vessel_name"] = name
+                break
+
+    # ── Ship particulars — map known Equasis labels ───────────────────────────
     FIELD_MAP = {
+        "vessel_name":   ["Ship name", "Name", "Vessel name"],
         "Flag":          ["Flag", "Flag State", "Flag state"],
         "Type of ship":  ["Type of ship", "Ship type", "Type"],
         "MMSI":          ["MMSI"],
-        "Call Sign":     ["Call sign", "Call Sign"],
-        "Gross tonnage": ["Gross tonnage", "GT"],
-        "DWT":           ["Deadweight", "DWT"],
-        "Year of build": ["Year of build", "Year built"],
-        "Status":        ["Status"],
+        "Call Sign":     ["Call sign", "Call Sign", "Callsign"],
+        "Gross tonnage": ["Gross tonnage", "GT", "Gross Tonnage"],
+        "DWT":           ["Deadweight", "DWT", "Deadweight (t)"],
+        "Year of build": ["Year of build", "Built", "Year built", "Year of Build"],
+        "Status":        ["Status", "Ship status"],
+        "IMO":           ["IMO number", "IMO No", "IMO"],
     }
     for out_key, candidates in FIELD_MAP.items():
         for candidate in candidates:
@@ -554,63 +551,48 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
                 result[out_key] = pairs[candidate]
                 break
 
-    # ── Management table: table.tableLS — tds[1]=role, [2]=company, [3]=address ──
-    OWNER_KEYWORDS = ["registered owner"]
-    PI_KEYWORDS    = ["p&i", "protection", "indemnity"]
-    CLASS_KEYWORDS = ["class"]
+    # ── Company section — owner, P&I, class ──────────────────────────────────
+    # Equasis renders company associations in a separate table section.
+    # Strategy: find all rows where the first cell contains a company role keyword.
+    OWNER_KEYWORDS   = ["registered owner", "owner"]
+    PI_KEYWORDS      = ["p&i club", "p & i", "protection", "p and i"]
+    CLASS_KEYWORDS   = ["class", "classification"]
 
-    for tr in soup.select("table.tableLS tbody tr"):
-        tds = tr.select("td")
-        if len(tds) < 3:
-            continue
-        role    = tds[1].get_text(strip=True).lower()
-        company = tds[2].get_text(strip=True)
-        address = tds[3].get_text(strip=True) if len(tds) > 3 else ""
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 2:
+                continue
+            role = cells[0].get_text(" ", strip=True).lower()
+            company_name = cells[1].get_text(" ", strip=True)
 
-        if any(k in role for k in OWNER_KEYWORDS) and company:
-            if "equasis_owner" not in result:
-                result["equasis_owner"] = company
-                if address:
-                    result["equasis_address"] = address
+            # Address is often in a 3rd cell or next row
+            address = cells[2].get_text(" ", strip=True) if len(cells) > 2 else ""
 
-        elif any(k in role for k in PI_KEYWORDS) and company:
-            if "pi_club" not in result:
-                result["pi_club"] = company
+            if any(k in role for k in OWNER_KEYWORDS) and company_name:
+                if "equasis_owner" not in result:
+                    result["equasis_owner"] = company_name
+                    if address:
+                        result["equasis_address"] = address
 
-        elif any(k in role for k in CLASS_KEYWORDS) and company:
-            if "class_society" not in result:
-                result["class_society"] = company
+            elif any(k in role for k in PI_KEYWORDS) and company_name:
+                if "pi_club" not in result:
+                    result["pi_club"] = company_name
 
-    # ── P&I Club: #collapse6 → round-list.orange-equasis → parent col → <p> ──
-    # Equasis puts P&I in collapse6 section. Company name is in <p> next to the dot.
-    if "pi_club" not in result:
-        collapse6 = soup.find("div", id="collapse6")
-        if collapse6:
-            marker = collapse6.find("div", class_=lambda c: c and "round-list" in c and "orange-equasis" in c)
-            if marker:
-                col = marker.find_parent("div", class_=re.compile(r"col-lg-\d"))
-                if col:
-                    p = col.find("p")
-                    if p:
-                        result["pi_club"] = p.get_text(strip=True)
+            elif any(k in role for k in CLASS_KEYWORDS) and company_name:
+                if "class_society" not in result:
+                    result["class_society"] = company_name
 
-    # ── Classification society: #collapse4 → round-list.orange-equasis → parent col → <p> ──
-    # Equasis puts classification in collapse4. Same dot pattern, col-lg-3 width.
-    if "class_society" not in result:
-        collapse4 = soup.find("div", id="collapse4")
-        if collapse4:
-            marker = collapse4.find("div", class_=lambda c: c and "round-list" in c and "orange-equasis" in c)
-            if marker:
-                col = marker.find_parent("div", class_=re.compile(r"col-lg-\d"))
-                if col:
-                    p = col.find("p")
-                    if p:
-                        result["class_society"] = p.get_text(strip=True)
+    # ── Fallback: regex scan full text for owner if table parsing missed it ──
+    if "equasis_owner" not in result:
+        m = re.search(r"Registered\s+owner\s*[:\-]?\s*([A-Z][^\n\r]{3,80})", text, re.IGNORECASE)
+        if m:
+            result["equasis_owner"] = m.group(1).strip()
 
     logger.info(
         f"IMO {imo} | Equasis: name={result.get('vessel_name')} "
-        f"flag={result.get('Flag')} owner={result.get('equasis_owner')} "
-        f"pi={result.get('pi_club')} class={result.get('class_society')}"
+        f"owner={result.get('equasis_owner')} flag={result.get('Flag')}"
     )
     return result
 

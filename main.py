@@ -525,12 +525,16 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
         result["vessel_name"] = h4.get_text(strip=True)
 
     # ── Ship particulars: div.row → col-lg-4 label/value pairs ───────────────
+    # Flag row is special: col[1] is an <img> with no text, col[2] is "(Morocco)"
     pairs: Dict[str, str] = {}
     for row in soup.select("div.row"):
         cols = row.select("div[class*='col-lg-4']")
         if len(cols) >= 2:
-            label = cols[0].get_text(strip=True).rstrip(":")
+            label = cols[0].get_text(strip=True).rstrip(":").strip()
             value = cols[1].get_text(strip=True)
+            # If value is empty (e.g. flag row has an img in col[1]), try col[2]
+            if not value and len(cols) >= 3:
+                value = cols[2].get_text(strip=True).strip("()").strip()
             if label and value and len(label) < 40:
                 pairs[label] = value
 
@@ -552,8 +556,8 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
 
     # ── Management table: table.tableLS — tds[1]=role, [2]=company, [3]=address ──
     OWNER_KEYWORDS = ["registered owner"]
-    PI_KEYWORDS    = ["p&i club", "p & i", "protection and indemnity"]
-    CLASS_KEYWORDS = ["class", "classification society"]
+    PI_KEYWORDS    = ["p&i", "protection", "indemnity"]
+    CLASS_KEYWORDS = ["class"]
 
     for tr in soup.select("table.tableLS tbody tr"):
         tds = tr.select("td")
@@ -577,13 +581,31 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             if "class_society" not in result:
                 result["class_society"] = company
 
-    # ── P&I Club from collapse6 div (fallback / supplement) ──────────────────
+    # ── P&I Club: #collapse6 → round-list.orange-equasis → parent col → <p> ──
+    # Equasis puts P&I in collapse6 section. Company name is in <p> next to the dot.
     if "pi_club" not in result:
-        pi_div = soup.find("div", id="collapse6")
-        if pi_div:
-            pi_text = pi_div.get_text(separator=" ", strip=True)
-            if pi_text:
-                result["pi_club"] = pi_text[:200]
+        collapse6 = soup.find("div", id="collapse6")
+        if collapse6:
+            marker = collapse6.find("div", class_=lambda c: c and "round-list" in c and "orange-equasis" in c)
+            if marker:
+                col = marker.find_parent("div", class_=re.compile(r"col-lg-\d"))
+                if col:
+                    p = col.find("p")
+                    if p:
+                        result["pi_club"] = p.get_text(strip=True)
+
+    # ── Classification society: #collapse4 → round-list.orange-equasis → parent col → <p> ──
+    # Equasis puts classification in collapse4. Same dot pattern, col-lg-3 width.
+    if "class_society" not in result:
+        collapse4 = soup.find("div", id="collapse4")
+        if collapse4:
+            marker = collapse4.find("div", class_=lambda c: c and "round-list" in c and "orange-equasis" in c)
+            if marker:
+                col = marker.find_parent("div", class_=re.compile(r"col-lg-\d"))
+                if col:
+                    p = col.find("p")
+                    if p:
+                        result["class_society"] = p.get_text(strip=True)
 
     logger.info(
         f"IMO {imo} | Equasis: name={result.get('vessel_name')} "

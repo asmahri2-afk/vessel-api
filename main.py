@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+import cloudscraper
 
 # ============================================================
 # LOGGING
@@ -238,28 +239,42 @@ def get_myshiptracking_pos_json(
     return None
 
 
-def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Optional[Dict[str, Any]]:
+import cloudscraper
+
+def get_myshiptracking_pos_from_page(mmsi: str) -> Optional[Dict[str, Any]]:
     """
-    Fallback: scrape vessel page HTML to get position, speed, course, timestamp.
-    Returns dict with lat, lon, sog, cog, last_pos_utc (string), ais_source.
+    Use cloudscraper to bypass Cloudflare and scrape vessel page HTML.
+    Returns dict with lat, lon, sog, cog, last_pos_utc, ais_source.
     """
     url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
-    headers = _make_headers(referer="https://www.myshiptracking.com/")
+    
+    # Create a cloudscraper session that mimics a real browser
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'mobile': False
+        },
+        delay=15  # Give Cloudflare time to respond
+    )
+    
     try:
-        r = session.get(url, headers=headers, timeout=15)
+        # Use the same headers as before
+        headers = _make_headers(referer="https://www.myshiptracking.com/")
+        r = scraper.get(url, headers=headers, timeout=30)
+        
         if r.status_code != 200:
             logger.warning(f"MyShipTracking page returned {r.status_code} for MMSI {mmsi}")
             return None
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # 1. Extract from paragraph in #ft-info (most reliable)
+        # Extract from paragraph in #ft-info
         info_div = soup.find("div", id="ft-info")
         if info_div:
             para = info_div.find("p")
             if para:
                 text = para.get_text()
-                # Example: "coordinates 28.04959° / -15.04246° as reported on 2026-04-13 17:00"
                 coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
                 speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
                 time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
@@ -267,13 +282,12 @@ def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Op
                     lat = float(coord_match.group(1))
                     lon = float(coord_match.group(2))
                     sog = float(speed_match.group(1))
-                    last_pos_utc = time_match.group(1) + " UTC"   # format "2026-04-13 17:00 UTC"
-                    # Try to get course from canvas script
+                    last_pos_utc = time_match.group(1) + " UTC"
+                    # Extract course from canvas script
                     cog = None
                     scripts = soup.find_all("script")
                     for script in scripts:
                         if script.string and "canvas_map_generate" in script.string:
-                            # order: canvas_map_generate(..., lat, lon, course, speed, ...)
                             match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
                             if match:
                                 cog = float(match.group(1))
@@ -366,7 +380,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
         if not mst_data:
             # Fallback: scrape the public page
-            mst_data = get_myshiptracking_pos_from_page(mmsi, session)
+            mst_data = get_myshiptracking_pos_from_page(mmsi)
             if mst_data and "last_pos_utc" in mst_data:
                 # Replace the timestamp with the one from the page (more accurate)
                 last_pos_utc = mst_data.pop("last_pos_utc")

@@ -222,7 +222,7 @@ def get_myshiptracking_pos(
         target_mmsi = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
-            if len(parts) >= 8 and parts[2].strip() == target_mmsi:
+            if len(parts) >= 7 and parts[2].strip() == target_mmsi:
                 return {
                     "lat": float(parts[4]),
                     "lon": float(parts[5]),
@@ -236,7 +236,7 @@ def get_myshiptracking_pos(
     return None
 
 # ============================================================
-# MAIN SCRAPER
+# MAIN SCRAPER (INDENTATION FIXED)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -300,10 +300,11 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-if mmsi is not None and vf_lat is not None and vf_lon is not None:
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
-else:
-    mst_data = None
+    # ========== FIXED INDENTATION: THIS BLOCK IS NOW INSIDE THE FUNCTION ==========
+    if mmsi is not None and vf_lat is not None and vf_lon is not None:
+        mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
+    else:
+        mst_data = None
 
     use_mst = False
     vf_age  = get_vf_age_minutes(last_pos_utc)
@@ -437,20 +438,9 @@ def vessel_batch(body: BatchRequest, request: Request):
 EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
 EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
 
-# Session cache — reused across requests to avoid a new login for every IMO
-_equasis_session_cache: Optional[requests.Session] = None
-_equasis_last_request_time: float = 0.0
-EQUASIS_MIN_INTERVAL_SEC = 20  # minimum seconds between Equasis vessel fetches
-
 def _equasis_session() -> requests.Session:
-    global _equasis_session_cache
-
     if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
-
-    # Reuse existing session if available
-    if _equasis_session_cache is not None:
-        return _equasis_session_cache
 
     session = requests.Session()
     headers = {
@@ -473,23 +463,9 @@ def _equasis_session() -> requests.Session:
     if "j_password" in r.text or ("invalid" in r.text.lower() and "password" in r.text.lower()):
         raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
 
-    logger.info("Equasis session created and cached.")
-    _equasis_session_cache = session
     return session
 
-def _equasis_rate_limit():
-    """Enforce minimum interval between Equasis vessel fetches."""
-    global _equasis_last_request_time
-    elapsed = time.time() - _equasis_last_request_time
-    if elapsed < EQUASIS_MIN_INTERVAL_SEC:
-        wait = EQUASIS_MIN_INTERVAL_SEC - elapsed
-        logger.info(f"Equasis rate limit: waiting {wait:.1f}s before next request")
-        time.sleep(wait)
-    _equasis_last_request_time = time.time()
-
 def scrape_equasis(imo: str) -> Dict[str, Any]:
-    global _equasis_session_cache
-    _equasis_rate_limit()
     session = _equasis_session()
 
     headers = {
@@ -510,21 +486,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
 
-    # If session expired, Equasis redirects back to login page
-    if "j_password" in r.text or "HomePage" in r.url:
-        logger.warning("Equasis session expired — invalidating cache and retrying login")
-        _equasis_session_cache = None
-        session = _equasis_session()
-        r = session.get(
-            EQUASIS_VESSEL_URL,
-            params={"fs": "Search", "P_IMO": imo},
-            headers=headers,
-            timeout=15,
-        )
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text(" ", strip=True)
-
     if "no vessel found" in text.lower() or "not found" in text.lower():
         return {"found": False, "imo": imo}
 
@@ -538,7 +499,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             result["vessel_name"] = name_b.get_text(strip=True)
 
     # ── Ship particulars (div.row based) ──────────────────────────────────────
-    # Locate the container that holds the ship info rows.
     info_container = None
     for access_item in soup.find_all("div", class_="access-item"):
         rows = access_item.find_all("div", class_="row")
@@ -556,7 +516,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             value_col = cols[1]
             value_text = value_col.get_text(" ", strip=True)
 
-            # For flag, the country name is often in parentheses in the third column
             if "Flag" in label:
                 flag_match = re.search(r"\(([^)]+)\)", row.get_text())
                 if flag_match:
@@ -582,7 +541,6 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
                 elif "Status" in label:
                     result["Status"] = value_text
 
-    # Fallback for name
     if "vessel_name" not in result:
         h1 = soup.find("h1")
         if h1:
@@ -654,13 +612,6 @@ def equasis_vessel(imo: str, request: Request):
         raise HTTPException(status_code=404, detail="Vessel not found on Equasis")
 
     return data
-
-# ============================================================
-# SOF — STATEMENT OF FACTS GENERATOR
-# ============================================================
-
-# (SOF code unchanged from your original – omitted for brevity)
-# ... (include your existing SOF endpoints and classes here)
 
 # ============================================================
 # SOF — STATEMENT OF FACTS GENERATOR

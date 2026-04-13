@@ -6,7 +6,6 @@ import re
 import requests
 import httpx
 import io
-import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
 from datetime import datetime, timezone
@@ -18,7 +17,6 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
-from playwright.async_api import async_playwright
 
 # ============================================================
 # LOGGING
@@ -176,7 +174,7 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPERS (JSON + HTML + Playwright)
+# MYSHIPTRACKING HELPERS (JSON endpoint + HTML fallback)
 # ============================================================
 
 def get_myshiptracking_pos_json(
@@ -242,7 +240,8 @@ def get_myshiptracking_pos_json(
 
 def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Optional[Dict[str, Any]]:
     """
-    Fallback: scrape vessel page HTML using requests (often 403 now).
+    Fallback: scrape vessel page HTML to get position, speed, course, timestamp.
+    Returns dict with lat, lon, sog, cog, last_pos_utc (string), ais_source.
     """
     url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
     headers = _make_headers(referer="https://www.myshiptracking.com/")
@@ -254,12 +253,13 @@ def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Op
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # 1. Extract from paragraph in #ft-info
+        # 1. Extract from paragraph in #ft-info (most reliable)
         info_div = soup.find("div", id="ft-info")
         if info_div:
             para = info_div.find("p")
             if para:
                 text = para.get_text()
+                # Example: "coordinates 28.04959° / -15.04246° as reported on 2026-04-13 17:00"
                 coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
                 speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
                 time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
@@ -267,12 +267,13 @@ def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Op
                     lat = float(coord_match.group(1))
                     lon = float(coord_match.group(2))
                     sog = float(speed_match.group(1))
-                    last_pos_utc = time_match.group(1) + " UTC"
-                    # Extract course from canvas script
+                    last_pos_utc = time_match.group(1) + " UTC"   # format "2026-04-13 17:00 UTC"
+                    # Try to get course from canvas script
                     cog = None
                     scripts = soup.find_all("script")
                     for script in scripts:
                         if script.string and "canvas_map_generate" in script.string:
+                            # order: canvas_map_generate(..., lat, lon, course, speed, ...)
                             match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
                             if match:
                                 cog = float(match.group(1))
@@ -293,103 +294,8 @@ def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Op
         return None
 
 
-async def fetch_myshiptracking_with_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
-    """
-    Last resort: use Playwright to render the page (bypasses Cloudflare).
-    Sets realistic headers and referer to avoid detection.
-    """
-    try:
-        async with async_playwright() as p:
-            # Launch headless Chromium with anti-detection args
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-features=IsolateOrigins,site-per-process',
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage'
-                ]
-            )
-            # Create context with realistic viewport and custom headers
-            context = await browser.new_context(
-                user_agent=random.choice(_USER_AGENTS),
-                viewport={'width': 1280, 'height': 800},
-                extra_http_headers={
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Referer': 'https://www.myshiptracking.com/',
-                    'DNT': '1'
-                }
-            )
-            page = await context.new_page()
-            url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
-            logger.info(f"Playwright navigating to {url}")
-            await page.goto(url, timeout=30000, wait_until='networkidle')
-            
-            # Wait for either the info paragraph or the canvas
-            try:
-                await page.wait_for_selector('#ft-info p', timeout=10000)
-            except:
-                await page.wait_for_selector('canvas#map_locator', timeout=10000)
-            
-            # Get page text
-            text = await page.inner_text('#ft-info') if await page.query_selector('#ft-info') else await page.content()
-            
-            # Extract using regex
-            coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
-            speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
-            time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
-            
-            # Extract course from canvas script
-            cog = None
-            scripts = await page.query_selector_all('script')
-            for script in scripts:
-                script_content = await script.inner_text()
-                if script_content and "canvas_map_generate" in script_content:
-                    match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script_content)
-                    if match:
-                        cog = float(match.group(1))
-                        break
-            
-            await browser.close()
-            
-            if coord_match and speed_match and time_match:
-                return {
-                    "lat": float(coord_match.group(1)),
-                    "lon": float(coord_match.group(2)),
-                    "sog": float(speed_match.group(1)),
-                    "cog": cog,
-                    "last_pos_utc": time_match.group(1) + " UTC",
-                    "ais_source": "myshiptracking_playwright"
-                }
-            else:
-                logger.warning(f"Playwright could not parse position for MMSI {mmsi}")
-                return None
-                
-    except Exception as e:
-        logger.error(f"Playwright failed for MMSI {mmsi}: {e}")
-        return None
-
-def get_myshiptracking_pos_playwright_sync(mmsi: str) -> Optional[Dict[str, Any]]:
-    """Synchronous wrapper for the async Playwright function."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(asyncio.run, fetch_myshiptracking_with_playwright(mmsi))
-                return future.result(timeout=45)
-        else:
-            return asyncio.run(fetch_myshiptracking_with_playwright(mmsi))
-    except RuntimeError:
-        return asyncio.run(fetch_myshiptracking_with_playwright(mmsi))
-    except Exception as e:
-        logger.error(f"Playwright sync wrapper failed: {e}")
-        return None
-
-
 # ============================================================
-# MAIN SCRAPER (WITH MST FALLBACK CHAIN)
+# MAIN SCRAPER (WITH FALLBACK)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -453,22 +359,18 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== MYSHIPTRACKING FALLBACK CHAIN ==========
+    # ========== MYSHIPTRACKING FALLBACK ==========
     mst_data = None
     if mmsi is not None and vf_lat is not None and vf_lon is not None:
-        # 1. Try JSON endpoint
+        # First try the JSON endpoint (often 403)
         mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
         if not mst_data:
-            # 2. Try simple HTML page request
+            # Fallback: scrape the public page
             mst_data = get_myshiptracking_pos_from_page(mmsi, session)
-        if not mst_data:
-            # 3. Last resort: Playwright (bypasses Cloudflare)
-            logger.info(f"IMO {imo} | Trying Playwright for MMSI {mmsi}")
-            mst_data = get_myshiptracking_pos_playwright_sync(mmsi)
             if mst_data and "last_pos_utc" in mst_data:
-                # Replace VesselFinder timestamp with the one from MST (often fresher)
+                # Replace the timestamp with the one from the page (more accurate)
                 last_pos_utc = mst_data.pop("last_pos_utc")
-                logger.info(f"IMO {imo} | Using Playwright data, timestamp={last_pos_utc}")
+                logger.info(f"IMO {imo} | Using MyShipTracking page fallback, timestamp={last_pos_utc}")
 
     # ========== DECISION LOGIC (choose VF or MST) ==========
     use_mst = False
@@ -514,7 +416,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 
 
 # ============================================================
-# API ENDPOINTS (unchanged)
+# API ENDPOINTS
 # ============================================================
 
 def _check_auth(request: Request, imo: str = ""):
@@ -598,7 +500,7 @@ def vessel_batch(body: BatchRequest, request: Request):
     }
 
 # ============================================================
-# EQUASIS SCRAPER (unchanged)
+# EQUASIS SCRAPER (IMPROVED)
 # ============================================================
 
 EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
@@ -657,14 +559,14 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {"imo": imo, "found": True}
 
-    # Vessel name
+    # ── Vessel name ───────────────────────────────────────────────────────────
     name_header = soup.find("h4", class_="color-gris-bleu-copyright")
     if name_header:
         name_b = name_header.find("b")
         if name_b:
             result["vessel_name"] = name_b.get_text(strip=True)
 
-    # Ship particulars
+    # ── Ship particulars (div.row based) ──────────────────────────────────────
     info_container = None
     for access_item in soup.find_all("div", class_="access-item"):
         rows = access_item.find_all("div", class_="row")
@@ -712,7 +614,7 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
         if h1:
             result["vessel_name"] = h1.get_text(strip=True)
 
-    # Management detail
+    # ── Management detail (owner, address) ────────────────────────────────────
     mgt_table = soup.find("table", class_="tableLS")
     if mgt_table:
         rows = mgt_table.find_all("tr")
@@ -732,7 +634,7 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
         if m:
             result["equasis_owner"] = m.group(1).strip()
 
-    # P&I Information
+    # ── P&I Information ───────────────────────────────────────────────────────
     pi_section = soup.find("h3", string=re.compile(r"P&I Information", re.I))
     if pi_section:
         parent = pi_section.find_parent("div", class_="cadre")
@@ -741,7 +643,7 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             if club_el:
                 result["pi_club"] = club_el.get_text(strip=True)
 
-    # Classification society
+    # ── Classification society ────────────────────────────────────────────────
     class_section = soup.find("h3", string=re.compile(r"Classification", re.I))
     if class_section:
         parent = class_section.find_parent("div", class_="cadre")
@@ -780,7 +682,7 @@ def equasis_vessel(imo: str, request: Request):
     return data
 
 # ============================================================
-# SOF — STATEMENT OF FACTS GENERATOR (unchanged)
+# SOF — STATEMENT OF FACTS GENERATOR
 # ============================================================
 
 DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']

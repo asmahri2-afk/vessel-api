@@ -300,7 +300,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    if mmsi is not None and vf_lat is not None:
+if mmsi is not None and vf_lat is not None and vf_lon is not None:
     mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
 else:
     mst_data = None

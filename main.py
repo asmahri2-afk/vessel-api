@@ -174,16 +174,17 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPER
+# MYSHIPTRACKING HELPERS (JSON endpoint + HTML fallback)
 # ============================================================
 
-def get_myshiptracking_pos(
+def get_myshiptracking_pos_json(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
     session: requests.Session,
     pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
+    """Original JSON endpoint – now often returns 403."""
     if center_lat is None or center_lon is None:
         return None
 
@@ -212,7 +213,7 @@ def get_myshiptracking_pos(
     try:
         r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
         if r.status_code != 200:
-            logger.warning(f"MyShipTracking returned status {r.status_code} for MMSI {mmsi}")
+            logger.warning(f"MyShipTracking JSON returned status {r.status_code} for MMSI {mmsi}")
             return None
 
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
@@ -228,15 +229,73 @@ def get_myshiptracking_pos(
                     "lon": float(parts[5]),
                     "sog": float(parts[6]) if parts[6] != "" else None,
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
+                    "ais_source": "myshiptracking_json"
                 }
 
     except Exception as e:
-        logger.warning(f"MyShipTracking fetch failed for MMSI {mmsi}: {e}")
+        logger.warning(f"MyShipTracking JSON fetch failed for MMSI {mmsi}: {e}")
 
     return None
 
+
+def get_myshiptracking_pos_from_page(mmsi: str, session: requests.Session) -> Optional[Dict[str, Any]]:
+    """
+    Fallback: scrape vessel page HTML to get position, speed, course, timestamp.
+    Returns dict with lat, lon, sog, cog, last_pos_utc (string), ais_source.
+    """
+    url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
+    headers = _make_headers(referer="https://www.myshiptracking.com/")
+    try:
+        r = session.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            logger.warning(f"MyShipTracking page returned {r.status_code} for MMSI {mmsi}")
+            return None
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # 1. Extract from paragraph in #ft-info (most reliable)
+        info_div = soup.find("div", id="ft-info")
+        if info_div:
+            para = info_div.find("p")
+            if para:
+                text = para.get_text()
+                # Example: "coordinates 28.04959° / -15.04246° as reported on 2026-04-13 17:00"
+                coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
+                speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
+                time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
+                if coord_match and speed_match and time_match:
+                    lat = float(coord_match.group(1))
+                    lon = float(coord_match.group(2))
+                    sog = float(speed_match.group(1))
+                    last_pos_utc = time_match.group(1) + " UTC"   # format "2026-04-13 17:00 UTC"
+                    # Try to get course from canvas script
+                    cog = None
+                    scripts = soup.find_all("script")
+                    for script in scripts:
+                        if script.string and "canvas_map_generate" in script.string:
+                            # order: canvas_map_generate(..., lat, lon, course, speed, ...)
+                            match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
+                            if match:
+                                cog = float(match.group(1))
+                                break
+                    return {
+                        "lat": lat,
+                        "lon": lon,
+                        "sog": sog,
+                        "cog": cog,
+                        "last_pos_utc": last_pos_utc,
+                        "ais_source": "myshiptracking_page"
+                    }
+        logger.warning(f"Could not parse position from MyShipTracking page for MMSI {mmsi}")
+        return None
+
+    except Exception as e:
+        logger.warning(f"MyShipTracking page scrape failed for MMSI {mmsi}: {e}")
+        return None
+
+
 # ============================================================
-# MAIN SCRAPER (INDENTATION FIXED)
+# MAIN SCRAPER (WITH FALLBACK)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -300,18 +359,26 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== FIXED INDENTATION: THIS BLOCK IS NOW INSIDE THE FUNCTION ==========
+    # ========== MYSHIPTRACKING FALLBACK ==========
+    mst_data = None
     if mmsi is not None and vf_lat is not None and vf_lon is not None:
-        mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
-    else:
-        mst_data = None
+        # First try the JSON endpoint (often 403)
+        mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
+        if not mst_data:
+            # Fallback: scrape the public page
+            mst_data = get_myshiptracking_pos_from_page(mmsi, session)
+            if mst_data and "last_pos_utc" in mst_data:
+                # Replace the timestamp with the one from the page (more accurate)
+                last_pos_utc = mst_data.pop("last_pos_utc")
+                logger.info(f"IMO {imo} | Using MyShipTracking page fallback, timestamp={last_pos_utc}")
 
+    # ========== DECISION LOGIC (choose VF or MST) ==========
     use_mst = False
-    vf_age  = get_vf_age_minutes(last_pos_utc)
+    vf_age = get_vf_age_minutes(last_pos_utc)
     MAX_VF_AGE = 60
 
     if mst_data:
-        vf_precision  = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
+        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
         mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
 
         if vf_lat is None:
@@ -331,7 +398,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         lat, lon = mst_data["lat"], mst_data["lon"]
         sog = mst_data.get("sog", sog)
         cog = mst_data.get("cog", cog)
-        ais_source = "myshiptracking"
+        ais_source = mst_data.get("ais_source", "myshiptracking")
     else:
         lat, lon = vf_lat, vf_lon
         ais_source = "vesselfinder"
@@ -346,6 +413,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         "lat": lat, "lon": lon, "sog": sog, "cog": cog,
         "ais_source": ais_source,
     }
+
 
 # ============================================================
 # API ENDPOINTS

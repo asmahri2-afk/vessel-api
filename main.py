@@ -222,7 +222,7 @@ def get_myshiptracking_pos(
         target_mmsi = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
-            if len(parts) >= 7 and parts[2].strip() == target_mmsi:
+            if len(parts) >= 8 and parts[2].strip() == target_mmsi:
                 return {
                     "lat": float(parts[4]),
                     "lon": float(parts[5]),
@@ -300,7 +300,10 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session) if (mmsi and vf_lat) else None
+    if mmsi is not None and vf_lat is not None:
+    mst_data = get_myshiptracking_pos(mmsi, vf_lat, vf_lon, session)
+else:
+    mst_data = None
 
     use_mst = False
     vf_age  = get_vf_age_minutes(last_pos_utc)

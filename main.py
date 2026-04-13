@@ -434,9 +434,20 @@ def vessel_batch(body: BatchRequest, request: Request):
 EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
 EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
 
+# Session cache — reused across requests to avoid a new login for every IMO
+_equasis_session_cache: Optional[requests.Session] = None
+_equasis_last_request_time: float = 0.0
+EQUASIS_MIN_INTERVAL_SEC = 20  # minimum seconds between Equasis vessel fetches
+
 def _equasis_session() -> requests.Session:
+    global _equasis_session_cache
+
     if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
+
+    # Reuse existing session if available
+    if _equasis_session_cache is not None:
+        return _equasis_session_cache
 
     session = requests.Session()
     headers = {
@@ -459,9 +470,23 @@ def _equasis_session() -> requests.Session:
     if "j_password" in r.text or ("invalid" in r.text.lower() and "password" in r.text.lower()):
         raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
 
+    logger.info("Equasis session created and cached.")
+    _equasis_session_cache = session
     return session
 
+def _equasis_rate_limit():
+    """Enforce minimum interval between Equasis vessel fetches."""
+    global _equasis_last_request_time
+    elapsed = time.time() - _equasis_last_request_time
+    if elapsed < EQUASIS_MIN_INTERVAL_SEC:
+        wait = EQUASIS_MIN_INTERVAL_SEC - elapsed
+        logger.info(f"Equasis rate limit: waiting {wait:.1f}s before next request")
+        time.sleep(wait)
+    _equasis_last_request_time = time.time()
+
 def scrape_equasis(imo: str) -> Dict[str, Any]:
+    global _equasis_session_cache
+    _equasis_rate_limit()
     session = _equasis_session()
 
     headers = {
@@ -481,6 +506,21 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
 
     soup = BeautifulSoup(r.text, "html.parser")
     text = soup.get_text(" ", strip=True)
+
+    # If session expired, Equasis redirects back to login page
+    if "j_password" in r.text or "HomePage" in r.url:
+        logger.warning("Equasis session expired — invalidating cache and retrying login")
+        _equasis_session_cache = None
+        session = _equasis_session()
+        r = session.get(
+            EQUASIS_VESSEL_URL,
+            params={"fs": "Search", "P_IMO": imo},
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = soup.get_text(" ", strip=True)
 
     if "no vessel found" in text.lower() or "not found" in text.lower():
         return {"found": False, "imo": imo}

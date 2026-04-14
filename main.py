@@ -247,10 +247,9 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
     Returns dict with lat, lon, sog, cog, last_pos_utc, ais_source.
     """
     url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
-    
+
     try:
         with sync_playwright() as p:
-            # Stealth arguments to hide headless state
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -261,7 +260,6 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
                     "--window-size=1920,1080",
                 ]
             )
-            
             context = browser.new_context(
                 user_agent=random.choice(_USER_AGENTS),
                 viewport={"width": 1920, "height": 1080},
@@ -269,18 +267,30 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
                 bypass_csp=True,
                 ignore_https_errors=True
             )
-            
             page = context.new_page()
-            
-            # Apply playwright-stealth to mask WebDriver fingerprints
-            stealth_sync(page)
-            
-            # Navigate and wait for network to go idle (ensures Cloudflare JS challenge completes)
+
+            # --- FIX: robust stealth application ---
+            try:
+                from playwright_stealth import stealth_sync
+                # Attempt direct call
+                if callable(stealth_sync):
+                    stealth_sync(page)
+                else:
+                    # Maybe it's a module with a 'stealth_sync' attribute
+                    if hasattr(stealth_sync, 'stealth_sync'):
+                        stealth_sync.stealth_sync(page)
+                    else:
+                        logger.warning("playwright_stealth.stealth_sync is not callable – skipping stealth")
+            except ImportError:
+                logger.warning("playwright_stealth not installed – skipping stealth")
+            except Exception as e:
+                logger.warning(f"Failed to apply playwright_stealth: {e} – continuing without stealth")
+            # ----------------------------------------
+
             page.goto(url, wait_until="networkidle", timeout=45000)
-            
             html_content = page.content()
             browser.close()
-            
+
             soup = BeautifulSoup(html_content, "html.parser")
 
             # Extract from paragraph in #ft-info
@@ -292,13 +302,13 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
                     coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
                     speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
                     time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
-                    
+
                     if coord_match and speed_match and time_match:
                         lat = float(coord_match.group(1))
                         lon = float(coord_match.group(2))
                         sog = float(speed_match.group(1))
                         last_pos_utc = time_match.group(1) + " UTC"
-                        
+
                         # Extract course from canvas script
                         cog = None
                         scripts = soup.find_all("script")
@@ -308,7 +318,7 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
                                 if match:
                                     cog = float(match.group(1))
                                     break
-                        
+
                         return {
                             "lat": lat,
                             "lon": lon,
@@ -317,7 +327,7 @@ def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
                             "last_pos_utc": last_pos_utc,
                             "ais_source": "myshiptracking_playwright"
                         }
-                        
+
             logger.warning(f"Could not parse position from MST Playwright page for MMSI {mmsi}")
             return None
 

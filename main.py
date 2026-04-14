@@ -18,10 +18,6 @@ from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
 
-# NEW PLAYWRIGHT IMPORTS
-from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
-
 # ============================================================
 # LOGGING
 # ============================================================
@@ -178,8 +174,100 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPERS (JSON endpoint + Playwright fallback)
+# MYSHIPTRACKING HELPERS (curl_cffi + BeautifulSoup)
 # ============================================================
+
+# We'll import curl_cffi only if available, with fallback to requests
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    logger.warning("curl_cffi not installed – MST HTML fallback will be disabled")
+
+def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
+    """
+    Scrape MyShipTracking vessel page using curl_cffi (impersonates real browser).
+    Falls back to regular requests if curl_cffi is unavailable.
+    Returns dict with lat, lon, sog, cog, last_pos_utc, ais_source.
+    """
+    if not CURL_CFFI_AVAILABLE:
+        logger.warning("curl_cffi not available – skipping MST HTML fallback")
+        return None
+
+    url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
+    headers = _make_headers(referer="https://www.myshiptracking.com/")
+
+    try:
+        # Impersonate Chrome 120 to bypass Cloudflare
+        response = curl_requests.get(
+            url,
+            headers=headers,
+            impersonate="chrome120",
+            timeout=20,
+            verify=False
+        )
+        if response.status_code != 200:
+            logger.warning(f"MST HTML returned {response.status_code} for MMSI {mmsi}")
+            return None
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Extract from #ft-info paragraph (primary method)
+        info_div = soup.find("div", id="ft-info")
+        if info_div:
+            para = info_div.find("p")
+            if para:
+                text = para.get_text()
+                coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text, re.IGNORECASE)
+                speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text, re.IGNORECASE)
+                time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
+
+                if coord_match and speed_match and time_match:
+                    lat = float(coord_match.group(1))
+                    lon = float(coord_match.group(2))
+                    sog = float(speed_match.group(1))
+                    last_pos_utc = time_match.group(1) + " UTC"
+
+                    # Extract course from canvas script
+                    cog = None
+                    for script in soup.find_all("script"):
+                        if script.string and "canvas_map_generate" in script.string:
+                            match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
+                            if match:
+                                cog = float(match.group(1))
+                                break
+
+                    return {
+                        "lat": lat, "lon": lon, "sog": sog, "cog": cog,
+                        "last_pos_utc": last_pos_utc,
+                        "ais_source": "myshiptracking_html"
+                    }
+
+        # Fallback: search for lat/lon in visible text
+        body_text = soup.get_text()
+        lat_match = re.search(r"Latitude:\s*([+-]?\d+\.?\d*)°", body_text, re.IGNORECASE)
+        lon_match = re.search(r"Longitude:\s*([+-]?\d+\.?\d*)°", body_text, re.IGNORECASE)
+        if lat_match and lon_match:
+            lat = float(lat_match.group(1))
+            lon = float(lon_match.group(1))
+            sog_match = re.search(r"Speed:\s*([+-]?\d+\.?\d*)\s*kn", body_text, re.IGNORECASE)
+            sog = float(sog_match.group(1)) if sog_match else None
+            time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text)
+            last_pos_utc = time_match.group(1) + " UTC" if time_match else None
+            if lat and lon:
+                return {
+                    "lat": lat, "lon": lon, "sog": sog, "cog": None,
+                    "last_pos_utc": last_pos_utc,
+                    "ais_source": "myshiptracking_html"
+                }
+
+        logger.warning(f"Could not parse position from MST HTML for MMSI {mmsi}")
+        return None
+
+    except Exception as e:
+        logger.warning(f"MST HTML scrape failed for MMSI {mmsi}: {e}")
+        return None
 
 def get_myshiptracking_pos_json(
     mmsi: str,
@@ -188,7 +276,7 @@ def get_myshiptracking_pos_json(
     session: requests.Session,
     pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
-    """Original JSON endpoint – now often returns 403."""
+    """Original JSON endpoint – often returns 403, but kept as a fallback."""
     if center_lat is None or center_lon is None:
         return None
 
@@ -241,102 +329,8 @@ def get_myshiptracking_pos_json(
 
     return None
 
-def get_myshiptracking_pos_playwright(mmsi: str) -> Optional[Dict[str, Any]]:
-    """
-    Use Playwright with strong stealth to bypass Cloudflare and scrape vessel page HTML.
-    Returns dict with lat, lon, sog, cog, last_pos_utc, ais_source.
-    """
-    url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                ]
-            )
-            context = browser.new_context(
-                user_agent=random.choice(_USER_AGENTS),
-                viewport={"width": 1920, "height": 1080},
-                java_script_enabled=True,
-                bypass_csp=True,
-                ignore_https_errors=True
-            )
-            page = context.new_page()
-
-            # --- FIX: robust stealth application ---
-            try:
-                from playwright_stealth import stealth_sync
-                # Attempt direct call
-                if callable(stealth_sync):
-                    stealth_sync(page)
-                else:
-                    # Maybe it's a module with a 'stealth_sync' attribute
-                    if hasattr(stealth_sync, 'stealth_sync'):
-                        stealth_sync.stealth_sync(page)
-                    else:
-                        logger.warning("playwright_stealth.stealth_sync is not callable – skipping stealth")
-            except ImportError:
-                logger.warning("playwright_stealth not installed – skipping stealth")
-            except Exception as e:
-                logger.warning(f"Failed to apply playwright_stealth: {e} – continuing without stealth")
-            # ----------------------------------------
-
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            html_content = page.content()
-            browser.close()
-
-            soup = BeautifulSoup(html_content, "html.parser")
-
-            # Extract from paragraph in #ft-info
-            info_div = soup.find("div", id="ft-info")
-            if info_div:
-                para = info_div.find("p")
-                if para:
-                    text = para.get_text()
-                    coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text)
-                    speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text)
-                    time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
-
-                    if coord_match and speed_match and time_match:
-                        lat = float(coord_match.group(1))
-                        lon = float(coord_match.group(2))
-                        sog = float(speed_match.group(1))
-                        last_pos_utc = time_match.group(1) + " UTC"
-
-                        # Extract course from canvas script
-                        cog = None
-                        scripts = soup.find_all("script")
-                        for script in scripts:
-                            if script.string and "canvas_map_generate" in script.string:
-                                match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
-                                if match:
-                                    cog = float(match.group(1))
-                                    break
-
-                        return {
-                            "lat": lat,
-                            "lon": lon,
-                            "sog": sog,
-                            "cog": cog,
-                            "last_pos_utc": last_pos_utc,
-                            "ais_source": "myshiptracking_playwright"
-                        }
-
-            logger.warning(f"Could not parse position from MST Playwright page for MMSI {mmsi}")
-            return None
-
-    except Exception as e:
-        logger.warning(f"MST Playwright scrape failed for MMSI {mmsi}: {e}")
-        return None
-
 # ============================================================
-# MAIN SCRAPER (WITH FALLBACK)
+# MAIN SCRAPER (WITH MST HTML FALLBACK)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -400,16 +394,17 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== MYSHIPTRACKING FALLBACK ==========
+    # ========== MYSHIPTRACKING FALLBACK (curl_cffi HTML) ==========
     mst_data = None
     if mmsi is not None and vf_lat is not None and vf_lon is not None:
+        # First try JSON endpoint (quick, but often fails)
         mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
         if not mst_data:
-            # NEW: Execute Playwright stealth fallback
-            mst_data = get_myshiptracking_pos_playwright(mmsi)
+            # Then try HTML scraping with curl_cffi
+            mst_data = get_myshiptracking_pos_html(mmsi)
             if mst_data and "last_pos_utc" in mst_data:
                 last_pos_utc = mst_data.pop("last_pos_utc")
-                logger.info(f"IMO {imo} | Using MyShipTracking Playwright fallback, timestamp={last_pos_utc}")
+                logger.info(f"IMO {imo} | Using MyShipTracking HTML fallback, timestamp={last_pos_utc}")
 
     # ========== DECISION LOGIC (choose VF or MST) ==========
     use_mst = False
@@ -419,8 +414,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     if mst_data:
         vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
         mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-        
-        # Check if VF returned highly rounded coordinates (e.g. 25.0) which counts as 0 decimals.
+
         vf_is_rounded = (count_decimals(vf_lat) == 0 and count_decimals(vf_lon) == 0) if vf_lat is not None else False
 
         if vf_lat is None:
@@ -458,7 +452,6 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         "lat": lat, "lon": lon, "sog": sog, "cog": cog,
         "ais_source": ais_source,
     }
-
 
 # ============================================================
 # API ENDPOINTS

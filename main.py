@@ -36,18 +36,45 @@ logger = logging.getLogger(__name__)
 import random
 
 _USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 ]
 
 def _make_headers(referer: str = "https://www.vesselfinder.com/") -> dict:
     return {
         "User-Agent": random.choice(_USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": referer,
+        "DNT": "1",
+    }
+
+def _make_mst_headers() -> dict:
+    """
+    Headers that closely mirror a real Chrome 120 top-level navigation to
+    myshiptracking.com.  The Sec-Fetch-* set is what Cloudflare's JS challenge
+    checks — without these the TLS fingerprint alone is not enough.
+    """
+    return {
+        "User-Agent": random.choice(_USER_AGENTS),
+        # Chrome sends this exact Accept string for document navigations
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;"
+            "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        # Sec-Fetch-* — critical for Cloudflare bot detection
+        "Sec-Fetch-Dest":    "document",
+        "Sec-Fetch-Mode":    "navigate",
+        "Sec-Fetch-Site":    "none",      # direct navigation (no referrer)
+        "Sec-Fetch-User":    "?1",        # user-initiated
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": "max-age=0",
         "DNT": "1",
     }
 
@@ -174,100 +201,194 @@ def extract_mmsi(soup: BeautifulSoup, static_data: Dict[str, str]) -> Optional[s
     return None
 
 # ============================================================
-# MYSHIPTRACKING HELPERS (curl_cffi + BeautifulSoup)
+# MYSHIPTRACKING HELPERS
 # ============================================================
 
-# We'll import curl_cffi only if available, with fallback to requests
+# Import curl_cffi — required for MST TLS impersonation.
+# If missing, install with:  pip install curl_cffi --break-system-packages
 try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
+    logger.info("curl_cffi loaded — MST TLS impersonation enabled")
 except ImportError:
     CURL_CFFI_AVAILABLE = False
-    logger.warning("curl_cffi not installed – MST HTML fallback will be disabled")
+    logger.warning(
+        "curl_cffi not installed — MST HTML fallback will be disabled. "
+        "Install with: pip install curl_cffi --break-system-packages"
+    )
+
+
+def _extract_cog_from_scripts(soup: BeautifulSoup) -> Optional[float]:
+    """
+    Extract Course Over Ground from the hidden canvas_map_generate() JS call.
+
+    MST injects something like:
+        canvas_map_generate('canvas_map', 15, 28.123, -12.456, 187.5, 1, 0);
+    where the 5th argument is the COG in degrees.
+
+    We try two patterns — one for the exact function name and a broader numeric
+    capture — so minor JS changes don't break us.
+    """
+    for script in soup.find_all("script"):
+        raw = script.string
+        if not raw or "canvas_map_generate" not in raw:
+            continue
+
+        # Pattern A — explicit function call with at least 5 comma-separated args.
+        # Skips 4 leading args (any chars) then captures the 5th numeric arg.
+        m = re.search(
+            r"canvas_map_generate\s*\([^,]+,\s*[^,]+,\s*[^,]+,\s*[^,]+,\s*"
+            r"([+-]?\d+(?:\.\d+)?)\s*[,)]",
+            raw,
+        )
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+
+        # Pattern B — looser: find "canvas_map_generate" then grab the first
+        # 3-digit-ish number that looks like a heading (0–360).
+        m2 = re.search(
+            r"canvas_map_generate\s*\(.*?(\b[0-2]?\d{1,2}(?:\.\d+)?\b)\s*[,)]",
+            raw,
+            re.DOTALL,
+        )
+        if m2:
+            try:
+                val = float(m2.group(1))
+                if 0.0 <= val <= 360.0:
+                    return val
+            except ValueError:
+                pass
+
+    return None
+
 
 def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
     """
-    Scrape MyShipTracking vessel page using curl_cffi (impersonates real browser).
-    Falls back to regular requests if curl_cffi is unavailable.
-    Returns dict with lat, lon, sog, cog, last_pos_utc, ais_source.
+    Scrape the MyShipTracking vessel page using curl_cffi with Chrome 120
+    TLS impersonation to bypass Cloudflare protection.
+
+    Returns a dict with:
+        lat, lon, sog, cog, last_pos_utc, ais_source
+    or None on failure.
     """
     if not CURL_CFFI_AVAILABLE:
-        logger.warning("curl_cffi not available – skipping MST HTML fallback")
+        logger.warning("curl_cffi not available — skipping MST HTML fallback")
         return None
 
     url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
-    headers = _make_headers(referer="https://www.myshiptracking.com/")
 
     try:
-        # Impersonate Chrome 120 to bypass Cloudflare
         response = curl_requests.get(
             url,
-            headers=headers,
-            impersonate="chrome120",
-            timeout=20,
-            verify=False
+            headers=_make_mst_headers(),
+            impersonate="chrome120",   # TLS + HTTP/2 fingerprint of Chrome 120
+            timeout=25,
+            verify=True,               # keep TLS verification on; disabling it
+                                       # can itself look suspicious to Cloudflare
+            allow_redirects=True,
         )
+
+        if response.status_code == 403:
+            logger.warning(
+                f"MST returned 403 for MMSI {mmsi} — "
+                "Cloudflare challenge not bypassed (check curl_cffi version / impersonate string)"
+            )
+            return None
+
         if response.status_code != 200:
-            logger.warning(f"MST HTML returned {response.status_code} for MMSI {mmsi}")
+            logger.warning(f"MST HTML returned HTTP {response.status_code} for MMSI {mmsi}")
             return None
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # Extract from #ft-info paragraph (primary method)
+        # ------------------------------------------------------------------
+        # Primary extraction — #ft-info paragraph
+        # MST renders a human-readable sentence like:
+        #   "The vessel's coordinates are 28.123° / -12.456°,
+        #    her speed is 0.0 Knots and was reported on 2024-05-01 14:30"
+        # ------------------------------------------------------------------
         info_div = soup.find("div", id="ft-info")
         if info_div:
             para = info_div.find("p")
             if para:
-                text = para.get_text()
-                coord_match = re.search(r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°", text, re.IGNORECASE)
-                speed_match = re.search(r"speed is\s+([+-]?\d+\.?\d*)\s*Knots", text, re.IGNORECASE)
-                time_match = re.search(r"reported on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", text)
+                text = para.get_text(" ", strip=True)
+
+                coord_match = re.search(
+                    r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°",
+                    text, re.IGNORECASE,
+                )
+                speed_match = re.search(
+                    r"speed\s+is\s+([+-]?\d+\.?\d*)\s*Knots",
+                    text, re.IGNORECASE,
+                )
+                time_match = re.search(
+                    r"reported\s+on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
+                    text,
+                )
 
                 if coord_match and speed_match and time_match:
-                    lat = float(coord_match.group(1))
-                    lon = float(coord_match.group(2))
-                    sog = float(speed_match.group(1))
+                    lat          = float(coord_match.group(1))
+                    lon          = float(coord_match.group(2))
+                    sog          = float(speed_match.group(1))
                     last_pos_utc = time_match.group(1) + " UTC"
+                    cog          = _extract_cog_from_scripts(soup)
 
-                    # Extract course from canvas script
-                    cog = None
-                    for script in soup.find_all("script"):
-                        if script.string and "canvas_map_generate" in script.string:
-                            match = re.search(r"canvas_map_generate\([^,]+,\s*\d+,\s*[^,]+,\s*[^,]+,\s*([+-]?\d+\.?\d*),", script.string)
-                            if match:
-                                cog = float(match.group(1))
-                                break
-
+                    logger.info(
+                        f"MMSI {mmsi} | MST #ft-info: "
+                        f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}"
+                    )
                     return {
-                        "lat": lat, "lon": lon, "sog": sog, "cog": cog,
+                        "lat": lat,
+                        "lon": lon,
+                        "sog": sog,
+                        "cog": cog,
                         "last_pos_utc": last_pos_utc,
-                        "ais_source": "myshiptracking_html"
+                        "ais_source": "myshiptracking_html",
                     }
 
-        # Fallback: search for lat/lon in visible text
-        body_text = soup.get_text()
-        lat_match = re.search(r"Latitude:\s*([+-]?\d+\.?\d*)°", body_text, re.IGNORECASE)
-        lon_match = re.search(r"Longitude:\s*([+-]?\d+\.?\d*)°", body_text, re.IGNORECASE)
+        # ------------------------------------------------------------------
+        # Fallback — generic body text scan
+        # Catches alternative page layouts / future MST HTML changes
+        # ------------------------------------------------------------------
+        body_text = soup.get_text(" ", strip=True)
+
+        lat_match = re.search(r"Latitude[:\s]+([+-]?\d+\.?\d*)°?", body_text, re.IGNORECASE)
+        lon_match = re.search(r"Longitude[:\s]+([+-]?\d+\.?\d*)°?", body_text, re.IGNORECASE)
+
         if lat_match and lon_match:
             lat = float(lat_match.group(1))
             lon = float(lon_match.group(1))
-            sog_match = re.search(r"Speed:\s*([+-]?\d+\.?\d*)\s*kn", body_text, re.IGNORECASE)
-            sog = float(sog_match.group(1)) if sog_match else None
+
+            sog_match  = re.search(r"Speed[:\s]+([+-]?\d+\.?\d*)\s*kn", body_text, re.IGNORECASE)
             time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text)
-            last_pos_utc = time_match.group(1) + " UTC" if time_match else None
-            if lat and lon:
-                return {
-                    "lat": lat, "lon": lon, "sog": sog, "cog": None,
-                    "last_pos_utc": last_pos_utc,
-                    "ais_source": "myshiptracking_html"
-                }
+
+            sog          = float(sog_match.group(1)) if sog_match else None
+            last_pos_utc = (time_match.group(1) + " UTC") if time_match else None
+            cog          = _extract_cog_from_scripts(soup)
+
+            logger.info(
+                f"MMSI {mmsi} | MST body-text fallback: "
+                f"lat={lat}, lon={lon}, sog={sog}, cog={cog}"
+            )
+            return {
+                "lat": lat,
+                "lon": lon,
+                "sog": sog,
+                "cog": cog,
+                "last_pos_utc": last_pos_utc,
+                "ais_source": "myshiptracking_html",
+            }
 
         logger.warning(f"Could not parse position from MST HTML for MMSI {mmsi}")
         return None
 
     except Exception as e:
-        logger.warning(f"MST HTML scrape failed for MMSI {mmsi}: {e}")
+        logger.warning(f"MST HTML scrape failed for MMSI {mmsi}: {type(e).__name__}: {e}")
         return None
+
 
 def get_myshiptracking_pos_json(
     mmsi: str,
@@ -276,7 +397,10 @@ def get_myshiptracking_pos_json(
     session: requests.Session,
     pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
-    """Original JSON endpoint – often returns 403, but kept as a fallback."""
+    """
+    Original JSON endpoint — often returns 403, kept as a fast first attempt.
+    Falls through to the HTML method if this fails.
+    """
     if center_lat is None or center_lon is None:
         return None
 
@@ -321,7 +445,7 @@ def get_myshiptracking_pos_json(
                     "lon": float(parts[5]),
                     "sog": float(parts[6]) if parts[6] != "" else None,
                     "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
-                    "ais_source": "myshiptracking_json"
+                    "ais_source": "myshiptracking_json",
                 }
 
     except Exception as e:
@@ -330,7 +454,7 @@ def get_myshiptracking_pos_json(
     return None
 
 # ============================================================
-# MAIN SCRAPER (WITH MST HTML FALLBACK)
+# MAIN SCRAPER (VF primary + MST fallback)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -370,15 +494,23 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     final_static_data = {
         "imo": imo,
         "vessel_name": name,
-        "ship_type": static_data.get("Ship Type") or static_data.get("Ship type") or static_data.get("Type") or "",
-        "flag": (soup.select_one("div.title-flag-icon").get("title") if soup.select_one("div.title-flag-icon") else None),
+        "ship_type": (
+            static_data.get("Ship Type")
+            or static_data.get("Ship type")
+            or static_data.get("Type")
+            or ""
+        ),
+        "flag": (
+            soup.select_one("div.title-flag-icon").get("title")
+            if soup.select_one("div.title-flag-icon") else None
+        ),
         "mmsi": mmsi,
         "draught_m": draught_val or "",
-        "deadweight_t": static_data.get("Deadweight") or static_data.get("DWT"),
-        "gross_tonnage": static_data.get("Gross Tonnage"),
-        "year_of_build": static_data.get("Year of Build"),
-        "length_overall_m": static_data.get("Length Overall"),
-        "beam_m": static_data.get("Beam"),
+        "deadweight_t":      static_data.get("Deadweight") or static_data.get("DWT"),
+        "gross_tonnage":     static_data.get("Gross Tonnage"),
+        "year_of_build":     static_data.get("Year of Build"),
+        "length_overall_m":  static_data.get("Length Overall"),
+        "beam_m":            static_data.get("Beam"),
     }
 
     vf_lat = vf_lon = sog = cog = None
@@ -388,34 +520,40 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
             ais = json.loads(djson_div["data-json"])
             vf_lat = float(ais.get("ship_lat")) if ais.get("ship_lat") else None
             vf_lon = float(ais.get("ship_lon")) if ais.get("ship_lon") else None
-            sog = ais.get("ship_sog")
-            cog = ais.get("ship_cog")
+            sog    = ais.get("ship_sog")
+            cog    = ais.get("ship_cog")
             logger.info(f"IMO {imo} | VF AIS: lat={vf_lat}, lon={vf_lon}, sog={sog}, cog={cog}")
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== MYSHIPTRACKING FALLBACK (curl_cffi HTML) ==========
+    # ========== MYSHIPTRACKING FALLBACK ==========
     mst_data = None
     if mmsi is not None and vf_lat is not None and vf_lon is not None:
-        # First try JSON endpoint (quick, but often fails)
+        # 1) Try the fast JSON endpoint first (low overhead, often 403)
         mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
+
+        # 2) If JSON failed, fall back to curl_cffi HTML scraping
         if not mst_data:
-            # Then try HTML scraping with curl_cffi
             mst_data = get_myshiptracking_pos_html(mmsi)
             if mst_data and "last_pos_utc" in mst_data:
+                # The HTML scraper provides its own timestamp — promote it
                 last_pos_utc = mst_data.pop("last_pos_utc")
-                logger.info(f"IMO {imo} | Using MyShipTracking HTML fallback, timestamp={last_pos_utc}")
+                logger.info(
+                    f"IMO {imo} | MST HTML fallback succeeded, "
+                    f"timestamp={last_pos_utc}"
+                )
 
-    # ========== DECISION LOGIC (choose VF or MST) ==========
+    # ========== DECISION LOGIC (VF vs MST) ==========
     use_mst = False
-    vf_age = get_vf_age_minutes(last_pos_utc)
+    vf_age  = get_vf_age_minutes(last_pos_utc)
     MAX_VF_AGE = 60
 
     if mst_data:
-        vf_precision = count_decimals(vf_lat) + count_decimals(vf_lon) if vf_lat is not None else 0
+        vf_precision  = (count_decimals(vf_lat) + count_decimals(vf_lon)) if vf_lat is not None else 0
         mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-
-        vf_is_rounded = (count_decimals(vf_lat) == 0 and count_decimals(vf_lon) == 0) if vf_lat is not None else False
+        vf_is_rounded = (
+            count_decimals(vf_lat) == 0 and count_decimals(vf_lon) == 0
+        ) if vf_lat is not None else False
 
         if vf_lat is None:
             use_mst = True
@@ -425,7 +563,10 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
             logger.info(f"IMO {imo} | Using MST: VF data is {vf_age} min old (>{MAX_VF_AGE})")
         elif vf_is_rounded and mst_precision > 0:
             use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF coordinates are heavily rounded ({vf_lat}, {vf_lon}) compared to precise MST data.")
+            logger.info(
+                f"IMO {imo} | Using MST: VF coordinates are heavily rounded "
+                f"({vf_lat}, {vf_lon}) vs precise MST data"
+            )
         elif mst_precision > vf_precision:
             use_mst = True
             logger.info(f"IMO {imo} | Using MST: higher precision ({mst_precision} vs {vf_precision})")
@@ -435,11 +576,11 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 
     if use_mst and mst_data:
         lat, lon = mst_data["lat"], mst_data["lon"]
-        sog = mst_data.get("sog", sog)
-        cog = mst_data.get("cog", cog)
+        sog        = mst_data.get("sog", sog)
+        cog        = mst_data.get("cog", cog)
         ais_source = mst_data.get("ais_source", "myshiptracking")
     else:
-        lat, lon = vf_lat, vf_lon
+        lat, lon   = vf_lat, vf_lon
         ais_source = "vesselfinder"
 
     logger.info(f"IMO {imo} | Final: lat={lat}, lon={lon}, sog={sog}, source={ais_source}")
@@ -449,7 +590,10 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         "destination": destination,
         "last_pos_utc": last_pos_utc,
         **final_static_data,
-        "lat": lat, "lon": lon, "sog": sog, "cog": cog,
+        "lat": lat,
+        "lon": lon,
+        "sog": sog,
+        "cog": cog,
         "ais_source": ais_source,
     }
 
@@ -495,7 +639,10 @@ def vessel_batch(body: BatchRequest, request: Request):
     imos = list(dict.fromkeys(body.imos))
 
     if len(imos) > BATCH_MAX_IMOS:
-        raise HTTPException(status_code=400, detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many IMOs — max {BATCH_MAX_IMOS} per batch",
+        )
 
     invalid = [imo for imo in imos if not validate_imo(imo)]
     if invalid:
@@ -538,7 +685,7 @@ def vessel_batch(body: BatchRequest, request: Request):
     }
 
 # ============================================================
-# EQUASIS SCRAPER (IMPROVED)
+# EQUASIS SCRAPER
 # ============================================================
 
 EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
@@ -618,53 +765,39 @@ def scrape_equasis(imo: str) -> Dict[str, Any]:
             cols = row.find_all("div", class_=re.compile(r"col-(lg|md|sm|xs)-\d+"))
             if len(cols) < 2:
                 continue
-            label = cols[0].get_text(" ", strip=True).rstrip(":").strip()
-            value_col = cols[1]
+            label      = cols[0].get_text(" ", strip=True).rstrip(":").strip()
+            value_col  = cols[1]
             value_text = value_col.get_text(" ", strip=True)
 
             if "Flag" in label:
                 flag_match = re.search(r"\(([^)]+)\)", row.get_text())
-                if flag_match:
-                    value_text = flag_match.group(1)
-                else:
-                    value_text = value_text or ""
+                value_text = flag_match.group(1) if flag_match else value_text or ""
 
             if label and value_text:
-                if "Flag" in label:
-                    result["Flag"] = value_text
-                elif "Call Sign" in label:
-                    result["Call Sign"] = value_text
-                elif "MMSI" in label:
-                    result["MMSI"] = value_text
-                elif "Gross tonnage" in label:
-                    result["Gross tonnage"] = value_text
-                elif "DWT" in label:
-                    result["DWT"] = value_text
-                elif "Type of ship" in label:
-                    result["Type of ship"] = value_text
-                elif "Year of build" in label:
-                    result["Year of build"] = value_text
-                elif "Status" in label:
-                    result["Status"] = value_text
+                if "Flag" in label:           result["Flag"]           = value_text
+                elif "Call Sign" in label:    result["Call Sign"]      = value_text
+                elif "MMSI" in label:         result["MMSI"]           = value_text
+                elif "Gross tonnage" in label: result["Gross tonnage"] = value_text
+                elif "DWT" in label:          result["DWT"]            = value_text
+                elif "Type of ship" in label: result["Type of ship"]   = value_text
+                elif "Year of build" in label: result["Year of build"] = value_text
+                elif "Status" in label:       result["Status"]         = value_text
 
     if "vessel_name" not in result:
         h1 = soup.find("h1")
         if h1:
             result["vessel_name"] = h1.get_text(strip=True)
 
-    # ── Management detail (owner, address) ────────────────────────────────────
+    # ── Management / registered owner ─────────────────────────────────────────
     mgt_table = soup.find("table", class_="tableLS")
     if mgt_table:
-        rows = mgt_table.find_all("tr")
-        for row in rows:
+        for row in mgt_table.find_all("tr"):
             cells = row.find_all("td")
             if len(cells) >= 4:
                 role = cells[1].get_text(strip=True).lower()
                 if "registered owner" in role:
-                    owner_name = cells[2].get_text(strip=True)
-                    owner_address = cells[3].get_text(strip=True)
-                    result["equasis_owner"] = owner_name
-                    result["equasis_address"] = owner_address
+                    result["equasis_owner"]   = cells[2].get_text(strip=True)
+                    result["equasis_address"] = cells[3].get_text(strip=True)
                     break
 
     if "equasis_owner" not in result:
@@ -723,7 +856,7 @@ def equasis_vessel(imo: str, request: Request):
 # SOF — STATEMENT OF FACTS GENERATOR
 # ============================================================
 
-DAYS = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday']
+DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
 
 class SOFRow(BaseModel):
     date:    Optional[str] = ''
@@ -833,16 +966,16 @@ async def sof_generate(data: SOFData, request: Request):
             '{{MASTER_REMARKS}}': data.master_remarks or '',
             '{{NOR_ACCEPTED}}':   data.nor_accepted or '',
             '{{OPERATION_VERB}}': operation_verb,
-            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':         fmt_dt(data.berthed_date, data.berthed_time),
-            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr': fmt_dt(data.disch_start_date, data.disch_start_time),
-            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':     fmt_dt(data.disch_end_date, data.disch_end_time),
-            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':   fmt_dt(data.cargo_docs_date, data.cargo_docs_time),
-            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':         fmt_dt(data.sailing_date, data.sailing_time),
-            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':               fmt_dt(data.eosp_date, data.eosp_time),
-            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':   fmt_dt(data.nor_tender_date, data.nor_tender_time),
-            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr': fmt_dt(data.anchor_drop_date, data.anchor_drop_time),
+            '{{BERTHED_DATE}} at {{BERTHED_TIME}} hr':           fmt_dt(data.berthed_date,      data.berthed_time),
+            '{{DISCH_START_DATE}} at {{DISCH_START_TIME}} hr':   fmt_dt(data.disch_start_date,  data.disch_start_time),
+            '{{DISCH_END_DATE}} at {{DISCH_END_TIME}} hr':       fmt_dt(data.disch_end_date,    data.disch_end_time),
+            '{{CARGO_DOCS_DATE}} at {{CARGO_DOCS_TIME}} hr':     fmt_dt(data.cargo_docs_date,   data.cargo_docs_time),
+            '{{SAILING_DATE}} at {{SAILING_TIME}} hr':           fmt_dt(data.sailing_date,      data.sailing_time),
+            '{{EOSP_DATE}} at {{EOSP_TIME}} hr':                 fmt_dt(data.eosp_date,         data.eosp_time),
+            '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':     fmt_dt(data.nor_tender_date,   data.nor_tender_time),
+            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr':   fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
             '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
-            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':             fmt_dt(data.pilot_date, data.pilot_time),
+            '{{PILOT_DATE}} at {{PILOT_TIME}} hr':               fmt_dt(data.pilot_date,        data.pilot_time),
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
         }
 
@@ -858,9 +991,9 @@ async def sof_generate(data: SOFData, request: Request):
         marker_row = template_row = end_row = None
         for row in ws.iter_rows():
             for cell in row:
-                if cell.value == '{{#EACH_ROW}}':   marker_row = cell.row
-                elif cell.value == '{{ROW_DATE}}':   template_row = cell.row
-                elif cell.value == '{{/EACH_ROW}}':  end_row = cell.row
+                if cell.value == '{{#EACH_ROW}}':  marker_row   = cell.row
+                elif cell.value == '{{ROW_DATE}}':  template_row = cell.row
+                elif cell.value == '{{/EACH_ROW}}': end_row      = cell.row
 
         if marker_row and template_row and data.rows:
             tpl_styles = {}
@@ -882,12 +1015,12 @@ async def sof_generate(data: SOFData, request: Request):
                 values = [
                     fmt_dt(row_data.date, '').split(' ')[0] if row_data.date else '',
                     get_day_name(row_data.date),
-                    row_data.wfrom.replace(':','') if row_data.wfrom else '',
-                    row_data.wto.replace(':','') if row_data.wto else '',
-                    row_data.sfrom.replace(':','') if row_data.sfrom else '',
-                    row_data.sto.replace(':','') if row_data.sto else '',
-                    row_data.cranes or '',
-                    row_data.qty or '',
+                    row_data.wfrom.replace(':', '') if row_data.wfrom else '',
+                    row_data.wto.replace(':', '')   if row_data.wto   else '',
+                    row_data.sfrom.replace(':', '') if row_data.sfrom else '',
+                    row_data.sto.replace(':', '')   if row_data.sto   else '',
+                    row_data.cranes  or '',
+                    row_data.qty     or '',
                     '',
                     row_data.remarks or '',
                     '',
@@ -896,11 +1029,12 @@ async def sof_generate(data: SOFData, request: Request):
                     cell = ws.cell(row=r, column=col)
                     cell.value = val if val else None
                     s = tpl_styles.get(col, {})
-                    if s.get('font'):      cell.font = s['font']
-                    if s.get('border'):    cell.border = s['border']
-                    if s.get('fill'):      cell.fill = s['fill']
+                    if s.get('font'):      cell.font      = s['font']
+                    if s.get('border'):    cell.border    = s['border']
+                    if s.get('fill'):      cell.fill      = s['fill']
                     if s.get('alignment'): cell.alignment = s['alignment']
 
+        # ── COMANAV logo injection ─────────────────────────────────────────────
         if (data.agent or '').upper() == 'COMANAV' and ws._images:
             try:
                 comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
@@ -913,21 +1047,24 @@ async def sof_generate(data: SOFData, request: Request):
                 old_img.ref = io.BytesIO(logo_bytes)
                 logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
             except Exception as e:
-                logger.warning(f"Logo swap failed (non-critical): {type(e).__name__}: {e}", exc_info=True)
+                logger.warning(
+                    f"Logo swap failed (non-critical): {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
 
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)
 
-        vessel = (data.vessel or 'VESSEL').replace(' ', '_')
-        port = (data.port or 'PORT').replace(' ', '_')
+        vessel   = (data.vessel or 'VESSEL').replace(' ', '_')
+        port     = (data.port   or 'PORT').replace(' ', '_')
         date_str = datetime.now().strftime('%Y%m%d')
         filename = f"SOF_{vessel}_{port}_{date_str}.xlsx"
 
         return Response(
             content=buf.read(),
             media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            headers={'Content-Disposition': f'attachment; filename="{filename}"'}
+            headers={'Content-Disposition': f'attachment; filename="{filename}"'},
         )
 
     except Exception as e:

@@ -1,8 +1,7 @@
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
 requests
 beautifulsoup4
-httpx
 openpyxl
-Pillow
-cloudscraper
+curl_cffi

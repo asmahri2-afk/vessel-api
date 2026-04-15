@@ -328,72 +328,39 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
             logger.warning(f"MST HTML returned HTTP {response.status_code} for MMSI {mmsi}")
             return None
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        text = response.text
 
         # ------------------------------------------------------------------
-        # Primary extraction — #ft-info paragraph
+        # Primary extraction — canvas_map_generate() JS call
+        #
+        # MST always injects this call with all position fields in one line:
+        #   canvas_map_generate("map_locator", zoom, lat, lon, cog, sog, ...)
+        # This is more reliable than scraping the HTML paragraphs which MST
+        # restructures frequently.
         # ------------------------------------------------------------------
-        info_div = soup.find("div", id="ft-info")
-        if info_div:
-            para = info_div.find("p")
-            if para:
-                text = para.get_text(" ", strip=True)
+        map_match = re.search(
+            r'canvas_map_generate\s*\(\s*["\'][^"\']*["\']\s*,\s*[\d.]+\s*,'
+            r'\s*([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)\s*,'
+            r'\s*([+-]?\d+\.?\d*)\s*,\s*([+-]?\d+\.?\d*)',
+            text,
+        )
+        if map_match:
+            lat = float(map_match.group(1))
+            lon = float(map_match.group(2))
+            cog = float(map_match.group(3))
+            sog = float(map_match.group(4))
 
-                coord_match = re.search(
-                    r"coordinates\s+([+-]?\d+\.?\d*)°\s*/\s*([+-]?\d+\.?\d*)°",
-                    text, re.IGNORECASE,
-                )
-                speed_match = re.search(
-                    r"speed\s+is\s+([+-]?\d+\.?\d*)\s*Knots",
-                    text, re.IGNORECASE,
-                )
-                time_match = re.search(
-                    r"reported\s+on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})",
-                    text,
-                )
-
-                if coord_match and speed_match and time_match:
-                    lat          = float(coord_match.group(1))
-                    lon          = float(coord_match.group(2))
-                    sog          = float(speed_match.group(1))
-                    last_pos_utc = time_match.group(1)   # kept as ISO — parsed by parse_mst_timestamp
-                    cog          = _extract_cog_from_scripts(soup)
-
-                    logger.info(
-                        f"MMSI {mmsi} | MST HTML #ft-info: "
-                        f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}"
-                    )
-                    return {
-                        "lat":          lat,
-                        "lon":          lon,
-                        "sog":          sog,
-                        "cog":          cog,
-                        "last_pos_utc": last_pos_utc,
-                        "ais_source":   "myshiptracking_html",
-                    }
-
-        # ------------------------------------------------------------------
-        # Fallback — generic body text scan
-        # ------------------------------------------------------------------
-        body_text = soup.get_text(" ", strip=True)
-
-        lat_match = re.search(r"Latitude[:\s]+([+-]?\d+\.?\d*)°?", body_text, re.IGNORECASE)
-        lon_match = re.search(r"Longitude[:\s]+([+-]?\d+\.?\d*)°?", body_text, re.IGNORECASE)
-
-        if lat_match and lon_match:
-            lat = float(lat_match.group(1))
-            lon = float(lon_match.group(1))
-
-            sog_match  = re.search(r"Speed[:\s]+([+-]?\d+\.?\d*)\s*kn", body_text, re.IGNORECASE)
-            time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text)
-
-            sog          = float(sog_match.group(1)) if sog_match else None
+            # Timestamp lives in the SEO paragraph outside ft-info:
+            # "as reported on <strong>2026-04-11 18:17</strong>"
+            time_match = re.search(
+                r'reported\s+on\b.{0,60}?(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})',
+                text,
+            )
             last_pos_utc = time_match.group(1) if time_match else None
-            cog          = _extract_cog_from_scripts(soup)
 
             logger.info(
-                f"MMSI {mmsi} | MST HTML body-text fallback: "
-                f"lat={lat}, lon={lon}, sog={sog}, cog={cog}"
+                f"MMSI {mmsi} | MST HTML canvas_map: "
+                f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}"
             )
             return {
                 "lat":          lat,
@@ -404,7 +371,7 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
                 "ais_source":   "myshiptracking_html",
             }
 
-        logger.warning(f"Could not parse position from MST HTML for MMSI {mmsi}")
+        logger.warning(f"Could not parse canvas_map_generate from MST HTML for MMSI {mmsi}")
         return None
 
     except Exception as e:
@@ -435,6 +402,9 @@ def get_myshiptracking_pos_vessel_api(mmsi: str) -> Optional[Dict[str, Any]]:
             url, headers=headers, impersonate="chrome120", timeout=10
         )
         if resp.status_code == 200:
+            if not resp.text.strip():
+                logger.debug(f"MST vessel API: empty response for MMSI {mmsi} — endpoint inactive")
+                return None
             data = resp.json()
             # Normalise field names — MST has used both 'lng' and 'lon' historically
             lat = data.get("lat") or data.get("latitude")

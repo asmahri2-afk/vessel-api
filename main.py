@@ -613,27 +613,29 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
             use_mst = True
             logger.info(f"IMO {imo} | Using MST: VF has no position")
 
-        elif vf_age <= 30 and vf_age <= mst_age:
-            use_mst = False
-            logger.info(
-                f"IMO {imo} | Using VF: recent signal "
-                f"(vf={vf_age}min, mst={mst_age}min)"
-            )
-
-        elif vf_age > 60 and mst_age < vf_age:
-            use_mst = True
-            logger.info(
-                f"IMO {imo} | Using MST: VF stale and MST fresher "
-                f"(vf={vf_age}min, mst={mst_age}min)"
-            )
-
         elif abs(vf_age - mst_age) <= 10:
-            # Similar freshness → precision tiebreaker
+            # Same or close signal age → precision is the tiebreaker
             use_mst = mst_precision > vf_precision
             logger.info(
                 f"IMO {imo} | Age tie (vf={vf_age}min, mst={mst_age}min) → "
                 f"{'MST' if use_mst else 'VF'} by precision "
                 f"(mst={mst_precision} vs vf={vf_precision} decimal places)"
+            )
+
+        elif vf_age <= 30 and vf_age < mst_age:
+            # VF is recent AND clearly fresher than MST
+            use_mst = False
+            logger.info(
+                f"IMO {imo} | Using VF: recent and fresher "
+                f"(vf={vf_age}min, mst={mst_age}min)"
+            )
+
+        elif vf_age > 60 and mst_age < vf_age:
+            # VF is stale AND MST is fresher
+            use_mst = True
+            logger.info(
+                f"IMO {imo} | Using MST: VF stale and MST fresher "
+                f"(vf={vf_age}min, mst={mst_age}min)"
             )
 
         elif mst_age < vf_age:

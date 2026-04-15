@@ -425,9 +425,9 @@ def get_myshiptracking_pos_vessel_api(mmsi: str) -> Optional[Dict[str, Any]]:
                 f"lat={result['lat']}, lon={result['lon']}, ts={result['last_pos_utc']}"
             )
             return result
-        logger.warning(f"MST vessel API returned HTTP {resp.status_code} for MMSI {mmsi}")
+        logger.debug(f"MST vessel API returned HTTP {resp.status_code} for MMSI {mmsi}")
     except Exception as e:
-        logger.warning(f"MST vessel API failed for MMSI {mmsi}: {type(e).__name__}: {e}")
+        logger.debug(f"MST vessel API failed for MMSI {mmsi}: {type(e).__name__}: {e}")
     return None
 
 
@@ -620,11 +620,11 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
                 f"(vf={vf_age}min, mst={mst_age}min)"
             )
 
-        elif vf_age > 60:
+        elif vf_age > 60 and mst_age < vf_age:
             use_mst = True
             logger.info(
-                f"IMO {imo} | Using MST: VF stale "
-                f"(vf={vf_age}min > 60min)"
+                f"IMO {imo} | Using MST: VF stale and MST fresher "
+                f"(vf={vf_age}min, mst={mst_age}min)"
             )
 
         elif abs(vf_age - mst_age) <= 10:

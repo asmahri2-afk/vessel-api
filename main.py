@@ -141,6 +141,34 @@ def get_vf_age_minutes(last_pos_utc: Optional[str]) -> int:
     age = (datetime.now(timezone.utc) - dt).total_seconds() / 60
     return int(age)
 
+def parse_mst_timestamp(ts: Optional[str]) -> Optional[datetime]:
+    """
+    Parse MST timestamps which come in ISO-style formats:
+      '2024-05-01 14:30', '2024-05-01 14:30:00', '2024-05-01T14:30:00', etc.
+    Handles both space- and T-separated variants, with or without seconds.
+    """
+    if not ts:
+        return None
+    ts = ts.replace(" UTC", "").replace("Z", "").strip()
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
+        try:
+            return datetime.strptime(ts, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    logger.warning(f"Could not parse MST timestamp: '{ts}'")
+    return None
+
+def get_mst_age_minutes(ts: Optional[str]) -> int:
+    dt = parse_mst_timestamp(ts)
+    if not dt:
+        return 999
+    return int((datetime.now(timezone.utc) - dt).total_seconds() / 60)
+
 # ============================================================
 # INPUT VALIDATION
 # ============================================================
@@ -213,7 +241,7 @@ try:
 except ImportError:
     CURL_CFFI_AVAILABLE = False
     logger.warning(
-        "curl_cffi not installed — MST HTML fallback will be disabled. "
+        "curl_cffi not installed — MST scraping will be disabled. "
         "Install with: pip install curl_cffi --break-system-packages"
     )
 
@@ -267,15 +295,14 @@ def _extract_cog_from_scripts(soup: BeautifulSoup) -> Optional[float]:
 
 def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
     """
-    Scrape the MyShipTracking vessel page using curl_cffi with Chrome 120
+    Tier 3 — scrape the MST vessel page using curl_cffi with Chrome 120
     TLS impersonation to bypass Cloudflare protection.
 
-    Returns a dict with:
-        lat, lon, sog, cog, last_pos_utc, ais_source
+    Returns a dict with: lat, lon, sog, cog, last_pos_utc, ais_source
     or None on failure.
     """
     if not CURL_CFFI_AVAILABLE:
-        logger.warning("curl_cffi not available — skipping MST HTML fallback")
+        logger.warning("curl_cffi not available — skipping MST HTML scrape")
         return None
 
     url = f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}"
@@ -284,17 +311,16 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
         response = curl_requests.get(
             url,
             headers=_make_mst_headers(),
-            impersonate="chrome120",   # TLS + HTTP/2 fingerprint of Chrome 120
+            impersonate="chrome120",
             timeout=25,
-            verify=True,               # keep TLS verification on; disabling it
-                                       # can itself look suspicious to Cloudflare
+            verify=True,
             allow_redirects=True,
         )
 
         if response.status_code == 403:
             logger.warning(
-                f"MST returned 403 for MMSI {mmsi} — "
-                "Cloudflare challenge not bypassed (check curl_cffi version / impersonate string)"
+                f"MST HTML returned 403 for MMSI {mmsi} — "
+                "Cloudflare challenge not bypassed"
             )
             return None
 
@@ -306,9 +332,6 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
 
         # ------------------------------------------------------------------
         # Primary extraction — #ft-info paragraph
-        # MST renders a human-readable sentence like:
-        #   "The vessel's coordinates are 28.123° / -12.456°,
-        #    her speed is 0.0 Knots and was reported on 2024-05-01 14:30"
         # ------------------------------------------------------------------
         info_div = soup.find("div", id="ft-info")
         if info_div:
@@ -333,25 +356,24 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
                     lat          = float(coord_match.group(1))
                     lon          = float(coord_match.group(2))
                     sog          = float(speed_match.group(1))
-                    last_pos_utc = time_match.group(1) + " UTC"
+                    last_pos_utc = time_match.group(1)   # kept as ISO — parsed by parse_mst_timestamp
                     cog          = _extract_cog_from_scripts(soup)
 
                     logger.info(
-                        f"MMSI {mmsi} | MST #ft-info: "
+                        f"MMSI {mmsi} | MST HTML #ft-info: "
                         f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}"
                     )
                     return {
-                        "lat": lat,
-                        "lon": lon,
-                        "sog": sog,
-                        "cog": cog,
+                        "lat":          lat,
+                        "lon":          lon,
+                        "sog":          sog,
+                        "cog":          cog,
                         "last_pos_utc": last_pos_utc,
-                        "ais_source": "myshiptracking_html",
+                        "ais_source":   "myshiptracking_html",
                     }
 
         # ------------------------------------------------------------------
         # Fallback — generic body text scan
-        # Catches alternative page layouts / future MST HTML changes
         # ------------------------------------------------------------------
         body_text = soup.get_text(" ", strip=True)
 
@@ -366,20 +388,20 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
             time_match = re.search(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})", body_text)
 
             sog          = float(sog_match.group(1)) if sog_match else None
-            last_pos_utc = (time_match.group(1) + " UTC") if time_match else None
+            last_pos_utc = time_match.group(1) if time_match else None
             cog          = _extract_cog_from_scripts(soup)
 
             logger.info(
-                f"MMSI {mmsi} | MST body-text fallback: "
+                f"MMSI {mmsi} | MST HTML body-text fallback: "
                 f"lat={lat}, lon={lon}, sog={sog}, cog={cog}"
             )
             return {
-                "lat": lat,
-                "lon": lon,
-                "sog": sog,
-                "cog": cog,
+                "lat":          lat,
+                "lon":          lon,
+                "sog":          sog,
+                "cog":          cog,
                 "last_pos_utc": last_pos_utc,
-                "ais_source": "myshiptracking_html",
+                "ais_source":   "myshiptracking_html",
             }
 
         logger.warning(f"Could not parse position from MST HTML for MMSI {mmsi}")
@@ -390,7 +412,56 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def get_myshiptracking_pos_json(
+def get_myshiptracking_pos_vessel_api(mmsi: str) -> Optional[Dict[str, Any]]:
+    """
+    Tier 1 — direct vessel-by-MMSI JSON endpoint.
+    Fastest path; also returns a timestamp so age comparison works correctly.
+    Uses curl_cffi with Chrome 120 impersonation to pass Cloudflare checks.
+    """
+    if not CURL_CFFI_AVAILABLE:
+        return None
+
+    url = f"https://www.myshiptracking.com/requests/vessel.php?type=json&mmsi={mmsi}"
+    headers = {
+        "User-Agent":        random.choice(_USER_AGENTS),
+        "Accept":            "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language":   "en-US,en;q=0.9",
+        "Accept-Encoding":   "gzip, deflate, br",
+        "Referer":           f"https://www.myshiptracking.com/vessels/mmsi-{mmsi}",
+        "X-Requested-With":  "XMLHttpRequest",
+    }
+    try:
+        resp = curl_requests.get(
+            url, headers=headers, impersonate="chrome120", timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # Normalise field names — MST has used both 'lng' and 'lon' historically
+            lat = data.get("lat") or data.get("latitude")
+            lon = data.get("lng") or data.get("lon") or data.get("longitude")
+            if lat is None or lon is None:
+                logger.warning(f"MST vessel API: no lat/lon in response for MMSI {mmsi}")
+                return None
+            result = {
+                "lat":          float(lat),
+                "lon":          float(lon),
+                "sog":          float(data["speed"])  if data.get("speed")  is not None else None,
+                "cog":          float(data["course"]) if data.get("course") is not None else None,
+                "last_pos_utc": data.get("received") or data.get("timestamp"),
+                "ais_source":   "myshiptracking_api",
+            }
+            logger.info(
+                f"MMSI {mmsi} | MST vessel API: "
+                f"lat={result['lat']}, lon={result['lon']}, ts={result['last_pos_utc']}"
+            )
+            return result
+        logger.warning(f"MST vessel API returned HTTP {resp.status_code} for MMSI {mmsi}")
+    except Exception as e:
+        logger.warning(f"MST vessel API failed for MMSI {mmsi}: {type(e).__name__}: {e}")
+    return None
+
+
+def get_myshiptracking_pos_map_json(
     mmsi: str,
     center_lat: Optional[float],
     center_lon: Optional[float],
@@ -398,63 +469,64 @@ def get_myshiptracking_pos_json(
     pad: float = 0.9,
 ) -> Optional[Dict[str, Any]]:
     """
-    Original JSON endpoint — often returns 403, kept as a fast first attempt.
-    Falls through to the HTML method if this fails.
+    Tier 2 — bounding-box map-tile JSON endpoint.
+    Requires known VF coordinates to build the bounding box.
+    Often returns 403 but kept as a lightweight second attempt.
+    Does NOT return a timestamp (map-tile data has none).
     """
     if center_lat is None or center_lon is None:
         return None
-
     try:
         lat_f, lon_f = float(center_lat), float(center_lon)
     except (TypeError, ValueError):
         return None
 
     current_year = datetime.now().year
-
     params = {
-        "type": "json",
-        "minlat": lat_f - pad, "maxlat": lat_f + pad,
-        "minlon": lon_f - pad, "maxlon": lon_f + pad,
-        "zoom": 15, "selid": -1, "seltype": 0, "timecode": -1,
-        "filters": json.dumps({
+        "type":     "json",
+        "minlat":   lat_f - pad,  "maxlat": lat_f + pad,
+        "minlon":   lon_f - pad,  "maxlon": lon_f + pad,
+        "zoom":     15,  "selid": -1,  "seltype": 0,  "timecode": -1,
+        "filters":  json.dumps({
             "vtypes": ",0,3,4,6,7,8,9,10,11,12,13", "ports": "1",
             "minsog": 0, "maxsog": 60, "minsz": 0, "maxsz": 500,
             "minyr": 1950, "maxyr": current_year, "status": "",
             "mapflt_from": "", "mapflt_dest": "",
         }),
     }
-
-    mst_headers = _make_headers(referer="https://www.myshiptracking.com/")
-
     try:
-        r = session.get(MYSHIPTRACKING_URL, params=params, headers=mst_headers, timeout=10)
+        r = session.get(
+            MYSHIPTRACKING_URL,
+            params=params,
+            headers=_make_headers(referer="https://www.myshiptracking.com/"),
+            timeout=10,
+        )
         if r.status_code != 200:
-            logger.warning(f"MyShipTracking JSON returned status {r.status_code} for MMSI {mmsi}")
+            logger.warning(f"MST map JSON returned HTTP {r.status_code} for MMSI {mmsi}")
             return None
 
         lines = [l.strip() for l in r.text.splitlines() if l.strip()]
         if len(lines) < 3:
             return None
 
-        target_mmsi = str(mmsi).strip()
+        target = str(mmsi).strip()
         for line in lines[2:]:
             parts = line.split("\t") if "\t" in line else line.split()
-            if len(parts) >= 7 and parts[2].strip() == target_mmsi:
+            if len(parts) >= 7 and parts[2].strip() == target:
                 return {
-                    "lat": float(parts[4]),
-                    "lon": float(parts[5]),
-                    "sog": float(parts[6]) if parts[6] != "" else None,
-                    "cog": float(parts[7]) if len(parts) > 7 and parts[7] != "" else None,
-                    "ais_source": "myshiptracking_json",
+                    "lat":          float(parts[4]),
+                    "lon":          float(parts[5]),
+                    "sog":          float(parts[6]) if parts[6] else None,
+                    "cog":          float(parts[7]) if len(parts) > 7 and parts[7] else None,
+                    "last_pos_utc": None,   # map-tile JSON carries no timestamp
+                    "ais_source":   "myshiptracking_map",
                 }
-
     except Exception as e:
-        logger.warning(f"MyShipTracking JSON fetch failed for MMSI {mmsi}: {e}")
-
+        logger.warning(f"MST map JSON failed for MMSI {mmsi}: {e}")
     return None
 
 # ============================================================
-# MAIN SCRAPER (VF primary + MST fallback)
+# MAIN SCRAPER (VF primary + MST 3-tier fallback)
 # ============================================================
 
 def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
@@ -526,56 +598,94 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== MYSHIPTRACKING FALLBACK ==========
+    # ========== MYSHIPTRACKING FALLBACK — 3 tiers ==========
     mst_data = None
-    if mmsi is not None and vf_lat is not None and vf_lon is not None:
-        # 1) Try the fast JSON endpoint first (low overhead, often 403)
-        mst_data = get_myshiptracking_pos_json(mmsi, vf_lat, vf_lon, session)
 
-        # 2) If JSON failed, fall back to curl_cffi HTML scraping
+    if mmsi is not None:
+        # Tier 1: direct vessel-by-MMSI API (fastest, has timestamp)
+        mst_data = get_myshiptracking_pos_vessel_api(mmsi)
+
+        # Tier 2: bounding-box map-tile JSON (needs VF coords, often 403)
+        if not mst_data and vf_lat is not None and vf_lon is not None:
+            mst_data = get_myshiptracking_pos_map_json(mmsi, vf_lat, vf_lon, session)
+
+        # Tier 3: curl_cffi full HTML scrape (slowest, most reliable)
         if not mst_data:
             mst_data = get_myshiptracking_pos_html(mmsi)
-            if mst_data and "last_pos_utc" in mst_data:
-                # The HTML scraper provides its own timestamp — promote it
-                last_pos_utc = mst_data.pop("last_pos_utc")
-                logger.info(
-                    f"IMO {imo} | MST HTML fallback succeeded, "
-                    f"timestamp={last_pos_utc}"
-                )
+
+    # Pull the MST timestamp out before the decision so both ages are comparable.
+    # We do NOT merge it into last_pos_utc yet — only do that if we actually use MST.
+    mst_last_pos_utc: Optional[str] = None
+    if mst_data and mst_data.get("last_pos_utc"):
+        mst_last_pos_utc = mst_data.pop("last_pos_utc")
 
     # ========== DECISION LOGIC (VF vs MST) ==========
+    #
+    # Priority order:
+    #   1. VF has no position at all               → always use MST
+    #   2. VF is recent (≤30 min) AND not older
+    #      than MST                                → prefer VF (fresh signal wins)
+    #   3. VF is stale (>60 min)                   → use MST
+    #   4. Age difference ≤10 min (effectively
+    #      same signal age)                        → tiebreak on coordinate precision
+    #   5. MST is meaningfully fresher             → use MST
+    #   6. Default                                 → VF
+    #
     use_mst = False
     vf_age  = get_vf_age_minutes(last_pos_utc)
-    MAX_VF_AGE = 60
+    mst_age = get_mst_age_minutes(mst_last_pos_utc) if mst_last_pos_utc else 999
 
     if mst_data:
         vf_precision  = (count_decimals(vf_lat) + count_decimals(vf_lon)) if vf_lat is not None else 0
         mst_precision = count_decimals(mst_data["lat"]) + count_decimals(mst_data["lon"])
-        vf_is_rounded = (
-            count_decimals(vf_lat) == 0 and count_decimals(vf_lon) == 0
-        ) if vf_lat is not None else False
 
         if vf_lat is None:
             use_mst = True
             logger.info(f"IMO {imo} | Using MST: VF has no position")
-        elif vf_age > MAX_VF_AGE:
-            use_mst = True
-            logger.info(f"IMO {imo} | Using MST: VF data is {vf_age} min old (>{MAX_VF_AGE})")
-        elif vf_is_rounded and mst_precision > 0:
+
+        elif vf_age <= 30 and vf_age <= mst_age:
+            use_mst = False
+            logger.info(
+                f"IMO {imo} | Using VF: recent signal "
+                f"(vf={vf_age}min, mst={mst_age}min)"
+            )
+
+        elif vf_age > 60:
             use_mst = True
             logger.info(
-                f"IMO {imo} | Using MST: VF coordinates are heavily rounded "
-                f"({vf_lat}, {vf_lon}) vs precise MST data"
+                f"IMO {imo} | Using MST: VF stale "
+                f"(vf={vf_age}min > 60min)"
             )
-        elif mst_precision > vf_precision:
+
+        elif abs(vf_age - mst_age) <= 10:
+            # Similar freshness → precision tiebreaker
+            use_mst = mst_precision > vf_precision
+            logger.info(
+                f"IMO {imo} | Age tie (vf={vf_age}min, mst={mst_age}min) → "
+                f"{'MST' if use_mst else 'VF'} by precision "
+                f"(mst={mst_precision} vs vf={vf_precision} decimal places)"
+            )
+
+        elif mst_age < vf_age:
             use_mst = True
-            logger.info(f"IMO {imo} | Using MST: higher precision ({mst_precision} vs {vf_precision})")
+            logger.info(
+                f"IMO {imo} | Using MST: fresher "
+                f"(mst={mst_age}min < vf={vf_age}min)"
+            )
+
         else:
             use_mst = False
-            logger.info(f"IMO {imo} | Using VF: fresher or equal precision (age={vf_age} min)")
+            logger.info(
+                f"IMO {imo} | Using VF: default "
+                f"(vf={vf_age}min, mst={mst_age}min)"
+            )
+
+    # Only promote the MST timestamp into last_pos_utc when we actually use MST
+    if use_mst and mst_last_pos_utc:
+        last_pos_utc = mst_last_pos_utc
 
     if use_mst and mst_data:
-        lat, lon = mst_data["lat"], mst_data["lon"]
+        lat, lon   = mst_data["lat"], mst_data["lon"]
         sog        = mst_data.get("sog", sog)
         cog        = mst_data.get("cog", cog)
         ais_source = mst_data.get("ais_source", "myshiptracking")

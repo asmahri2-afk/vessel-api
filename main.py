@@ -1092,6 +1092,15 @@ async def sof_generate(data: SOFData, request: Request):
                 for col in range(1, 12):
                     ws.cell(row=r, column=col).value = None
 
+            # Unmerge any merged cells in the ops-log writing zone
+            write_end = marker_row + len(data.rows) + 5
+            merges_to_remove = [
+                str(rng) for rng in ws.merged_cells.ranges
+                if rng.min_row >= marker_row and rng.max_row <= write_end
+            ]
+            for mr in merges_to_remove:
+                ws.unmerge_cells(mr)
+
             for i, row_data in enumerate(data.rows):
                 r = marker_row + i
                 values = [

@@ -293,13 +293,74 @@ def _extract_cog_from_scripts(soup: BeautifulSoup) -> Optional[float]:
     return None
 
 
+def _parse_mst_port_calls_from_soup(soup: BeautifulSoup) -> List[Dict]:
+    """
+    Extract the port calls history table from an already-parsed MST vessel page.
+
+    MST renders a <table class="myst-table"> with columns:
+      Port | Arrival | Departure | Duration
+    Each port cell contains an <a class="pflag"> with an <img title="Country">.
+    Date cells contain a <span> whose text is "YYYY-MM-DD HH:MM".
+
+    Returns a list of dicts: {port_name, country, arrived, departed, duration}
+    """
+    table = soup.find("table", class_="myst-table")
+    if not table:
+        return []
+    tbody = table.find("tbody")
+    if not tbody:
+        return []
+
+    def _parse_cell_date(cell) -> Optional[str]:
+        span = cell.find("span")
+        if not span:
+            return None
+        raw = span.get_text(separator=" ", strip=True)   # "2026-03-22 22:06"
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.replace(tzinfo=timezone.utc).isoformat()
+            except ValueError:
+                continue
+        logger.debug(f"MST port calls: could not parse date '{raw}'")
+        return None
+
+    results = []
+    for row in tbody.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) < 3:
+            continue
+
+        a_tag = cells[0].find("a", class_="pflag")
+        if not a_tag:
+            continue
+
+        port_name = a_tag.get_text(strip=True)
+        img       = a_tag.find("img")
+        country   = img["title"].strip() if img and img.get("title") else ""
+
+        results.append({
+            "port_name": port_name,
+            "country":   country,
+            "arrived":   _parse_cell_date(cells[1]),
+            "departed":  _parse_cell_date(cells[2]),
+            "duration":  cells[3].get_text(strip=True) if len(cells) > 3 else "",
+        })
+
+    return results
+
+
 def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
     """
     Tier 3 — scrape the MST vessel page using curl_cffi with Chrome 120
     TLS impersonation to bypass Cloudflare protection.
 
-    Returns a dict with: lat, lon, sog, cog, last_pos_utc, ais_source
+    Returns a dict with: lat, lon, sog, cog, last_pos_utc, ais_source, port_calls
     or None on failure.
+
+    NOTE: port_calls is ALWAYS populated from the same HTML fetch — no extra
+    HTTP request is ever made.  Callers should pop "port_calls" before using
+    the dict as position data.
     """
     if not CURL_CFFI_AVAILABLE:
         logger.warning("curl_cffi not available — skipping MST HTML scrape")
@@ -330,6 +391,9 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
 
         text = response.text
 
+        # Parse the HTML once — used for both position and port calls.
+        soup = BeautifulSoup(text, "html.parser")
+
         # ------------------------------------------------------------------
         # Primary extraction — canvas_map_generate() JS call
         #
@@ -358,9 +422,13 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
             )
             last_pos_utc = time_match.group(1) if time_match else None
 
+            # Extract port calls from the SAME already-downloaded HTML page.
+            port_calls = _parse_mst_port_calls_from_soup(soup)
+
             logger.info(
                 f"MMSI {mmsi} | MST HTML canvas_map: "
-                f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}"
+                f"lat={lat}, lon={lon}, sog={sog}, cog={cog}, ts={last_pos_utc}, "
+                f"port_calls={len(port_calls)}"
             )
             return {
                 "lat":          lat,
@@ -369,6 +437,22 @@ def get_myshiptracking_pos_html(mmsi: str) -> Optional[Dict[str, Any]]:
                 "cog":          cog,
                 "last_pos_utc": last_pos_utc,
                 "ais_source":   "myshiptracking_html",
+                "port_calls":   port_calls,   # ← piggy-backed, no extra request
+            }
+
+        # Position regex failed — still try to return port calls so the page
+        # fetch is not wasted (caller can check "port_calls" even on pos fail).
+        port_calls = _parse_mst_port_calls_from_soup(soup)
+        if port_calls:
+            logger.info(
+                f"MMSI {mmsi} | MST HTML: position regex failed but "
+                f"extracted {len(port_calls)} port calls"
+            )
+            return {
+                "lat": None, "lon": None, "sog": None, "cog": None,
+                "last_pos_utc": None,
+                "ais_source":   "myshiptracking_html",
+                "port_calls":   port_calls,
             }
 
         logger.warning(f"Could not parse canvas_map_generate from MST HTML for MMSI {mmsi}")
@@ -569,7 +653,8 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
     # ========== MYSHIPTRACKING FALLBACK — 3 tiers ==========
-    mst_data = None
+    mst_data       = None
+    mst_port_calls: List[Dict] = []   # port calls piggy-backed from Tier 3 HTML fetch
 
     if mmsi is not None:
         # Tier 1: direct vessel-by-MMSI API (fastest, has timestamp)
@@ -579,9 +664,15 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         if not mst_data and vf_lat is not None and vf_lon is not None:
             mst_data = get_myshiptracking_pos_map_json(mmsi, vf_lat, vf_lon, session)
 
-        # Tier 3: curl_cffi full HTML scrape (slowest, most reliable)
-        if not mst_data:
-            mst_data = get_myshiptracking_pos_html(mmsi)
+        # Tier 3: curl_cffi full HTML scrape (slowest, most reliable).
+        # Also parses port calls from the SAME page — no extra HTTP request needed.
+        if not mst_data or mst_data.get("lat") is None:
+            html_result = get_myshiptracking_pos_html(mmsi)
+            if html_result:
+                # Pull out port calls before using the dict as position data
+                mst_port_calls = html_result.pop("port_calls", [])
+                if html_result.get("lat") is not None:
+                    mst_data = html_result
 
     # Pull the MST timestamp out before the decision so both ages are comparable.
     # We do NOT merge it into last_pos_utc yet — only do that if we actually use MST.
@@ -677,6 +768,10 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         "sog": sog,
         "cog": cog,
         "ais_source": ais_source,
+        # Port calls are populated only when Tier 3 HTML scrape fired.
+        # Empty list means Tier 1/2 handled position — scrape_vesselfinder.py
+        # will request /port-calls/{imo} separately for stale entries.
+        "port_calls": mst_port_calls,
     }
 
 # ============================================================
@@ -713,6 +808,43 @@ def vessel_full(imo: str, request: Request):
         raise HTTPException(status_code=404, detail="Vessel not found")
 
     return data
+
+
+@app.get("/port-calls/{imo}")
+def port_calls_endpoint(imo: str, request: Request, mmsi: str = ""):
+    """
+    Fetch port calls for a vessel from the MST HTML page.
+
+    Called by scrape_vesselfinder.py post-loop when port calls are stale AND
+    Tier 3 did not fire during the main vessel-full scrape (i.e. Tier 1 or 2
+    handled position, so no HTML page was fetched yet).
+
+    Query param:
+        mmsi  — required, 9-digit MMSI of the vessel
+
+    Returns: { imo, count, port_calls: [...] }
+    """
+    _check_auth(request, imo)
+
+    if not validate_imo(imo):
+        raise HTTPException(status_code=400, detail="Invalid IMO number")
+
+    if not mmsi or not re.match(r'^\d{7,9}$', mmsi):
+        raise HTTPException(status_code=400, detail="mmsi query param required (7-9 digits)")
+
+    if not CURL_CFFI_AVAILABLE:
+        raise HTTPException(status_code=503, detail="curl_cffi not available on this instance")
+
+    result = get_myshiptracking_pos_html(mmsi)
+
+    if result is None:
+        logger.warning(f"port-calls/{imo}: MST HTML fetch returned None for MMSI {mmsi}")
+        return {"imo": imo, "count": 0, "port_calls": []}
+
+    calls = result.get("port_calls", [])
+    logger.info(f"port-calls/{imo}: returning {len(calls)} calls for MMSI {mmsi}")
+    return {"imo": imo, "count": len(calls), "port_calls": calls}
+
 
 @app.post("/vessel-batch")
 def vessel_batch(body: BatchRequest, request: Request):
@@ -778,167 +910,92 @@ def _equasis_session() -> requests.Session:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
 
     session = requests.Session()
-    headers = {
-        "User-Agent": random.choice(_USER_AGENTS),
-        "Referer": EQUASIS_LOGIN_URL,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+    session.headers.update(_make_headers(referer="https://www.equasis.org/"))
+
+    login_page = session.get(EQUASIS_LOGIN_URL, timeout=15)
+    login_page.raise_for_status()
+
+    login_soup = BeautifulSoup(login_page.text, "html.parser")
+    token_input = login_soup.find("input", {"name": "j_token"})
+    token = token_input["value"] if token_input else ""
+
+    login_data = {
+        "j_token":    token,
+        "j_email":    EQUASIS_EMAIL,
+        "j_password": EQUASIS_PASSWORD,
+        "submit":     "Login",
     }
+    login_resp = session.post(EQUASIS_LOGIN_URL, data=login_data, timeout=15)
+    login_resp.raise_for_status()
 
-    r = session.post(
-        EQUASIS_LOGIN_URL,
-        data={"j_email": EQUASIS_EMAIL, "j_password": EQUASIS_PASSWORD, "submit": "Login"},
-        headers=headers,
-        timeout=15,
-        allow_redirects=True,
-    )
-    r.raise_for_status()
-
-    if "j_password" in r.text or ("invalid" in r.text.lower() and "password" in r.text.lower()):
-        raise HTTPException(status_code=502, detail="Equasis login failed — check credentials")
+    if "logout" not in login_resp.text.lower() and "j_password" in login_resp.text.lower():
+        raise HTTPException(status_code=401, detail="Equasis login failed — check credentials")
 
     return session
 
-def scrape_equasis(imo: str) -> Dict[str, Any]:
-    session = _equasis_session()
+def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
+    params = {"P_IMO": imo}
+    resp   = session.get(EQUASIS_VESSEL_URL, params=params, timeout=20)
+    resp.raise_for_status()
 
-    headers = {
-        "User-Agent": random.choice(_USER_AGENTS),
-        "Referer": EQUASIS_LOGIN_URL,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Vessel name
+    name_el = soup.select_one("div.title-vessel h2") or soup.select_one("h2.title-vessel")
+    name    = name_el.get_text(strip=True) if name_el else ""
+
+    # Key info table
+    info: Dict[str, str] = {}
+    for row in soup.select("table.table-condensed tr"):
+        cells = row.find_all("td")
+        if len(cells) >= 2:
+            key = cells[0].get_text(strip=True).rstrip(":")
+            val = cells[1].get_text(strip=True)
+            if key:
+                info[key] = val
+
+    # P&I / class / inspections
+    pi_club = ""
+    for label in soup.find_all(string=re.compile(r"P&I", re.I)):
+        parent = label.find_parent("td")
+        if parent:
+            sib = parent.find_next_sibling("td")
+            if sib:
+                pi_club = sib.get_text(strip=True)
+                break
+
+    return {
+        "imo":          imo,
+        "name":         name,
+        "flag":         info.get("Flag") or info.get("Flag State"),
+        "gross_tonnage":info.get("Gross Tonnage") or info.get("GT"),
+        "deadweight_t": info.get("Deadweight") or info.get("DWT"),
+        "ship_type":    info.get("Ship type") or info.get("Vessel type"),
+        "year_of_build":info.get("Year of build") or info.get("Year Built"),
+        "pi_club":      pi_club,
+        "raw_info":     info,
     }
-
-    r = session.get(
-        EQUASIS_VESSEL_URL,
-        params={"fs": "Search", "P_IMO": imo},
-        headers=headers,
-        timeout=15,
-    )
-    r.raise_for_status()
-
-    soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ", strip=True)
-
-    if "no vessel found" in text.lower() or "not found" in text.lower():
-        return {"found": False, "imo": imo}
-
-    result: Dict[str, Any] = {"imo": imo, "found": True}
-
-    # ── Vessel name ───────────────────────────────────────────────────────────
-    name_header = soup.find("h4", class_="color-gris-bleu-copyright")
-    if name_header:
-        name_b = name_header.find("b")
-        if name_b:
-            result["vessel_name"] = name_b.get_text(strip=True)
-
-    # ── Ship particulars (div.row based) ──────────────────────────────────────
-    info_container = None
-    for access_item in soup.find_all("div", class_="access-item"):
-        rows = access_item.find_all("div", class_="row")
-        if any("Flag" in row.get_text() for row in rows):
-            info_container = access_item
-            break
-
-    if info_container:
-        rows = info_container.find_all("div", class_="row")
-        for row in rows:
-            cols = row.find_all("div", class_=re.compile(r"col-(lg|md|sm|xs)-\d+"))
-            if len(cols) < 2:
-                continue
-            label      = cols[0].get_text(" ", strip=True).rstrip(":").strip()
-            value_col  = cols[1]
-            value_text = value_col.get_text(" ", strip=True)
-
-            if "Flag" in label:
-                flag_match = re.search(r"\(([^)]+)\)", row.get_text())
-                value_text = flag_match.group(1) if flag_match else value_text or ""
-
-            if label and value_text:
-                if "Flag" in label:           result["Flag"]           = value_text
-                elif "Call Sign" in label:    result["Call Sign"]      = value_text
-                elif "MMSI" in label:         result["MMSI"]           = value_text
-                elif "Gross tonnage" in label: result["Gross tonnage"] = value_text
-                elif "DWT" in label:          result["DWT"]            = value_text
-                elif "Type of ship" in label: result["Type of ship"]   = value_text
-                elif "Year of build" in label: result["Year of build"] = value_text
-                elif "Status" in label:       result["Status"]         = value_text
-
-    if "vessel_name" not in result:
-        h1 = soup.find("h1")
-        if h1:
-            result["vessel_name"] = h1.get_text(strip=True)
-
-    # ── Management / registered owner ─────────────────────────────────────────
-    mgt_table = soup.find("table", class_="tableLS")
-    if mgt_table:
-        for row in mgt_table.find_all("tr"):
-            cells = row.find_all("td")
-            if len(cells) >= 4:
-                role = cells[1].get_text(strip=True).lower()
-                if "registered owner" in role:
-                    result["equasis_owner"]   = cells[2].get_text(strip=True)
-                    result["equasis_address"] = cells[3].get_text(strip=True)
-                    break
-
-    if "equasis_owner" not in result:
-        m = re.search(r"Registered\s+owner\s*[:\-]?\s*([A-Z][^\n\r]{3,80})", text, re.IGNORECASE)
-        if m:
-            result["equasis_owner"] = m.group(1).strip()
-
-    # ── P&I Information ───────────────────────────────────────────────────────
-    pi_section = soup.find("h3", string=re.compile(r"P&I Information", re.I))
-    if pi_section:
-        parent = pi_section.find_parent("div", class_="cadre")
-        if parent:
-            club_el = parent.find("p")
-            if club_el:
-                result["pi_club"] = club_el.get_text(strip=True)
-
-    # ── Classification society ────────────────────────────────────────────────
-    class_section = soup.find("h3", string=re.compile(r"Classification", re.I))
-    if class_section:
-        parent = class_section.find_parent("div", class_="cadre")
-        if parent:
-            for p in parent.find_all("p"):
-                txt = p.get_text(strip=True)
-                if "Register" in txt or "Class" in txt:
-                    result["class_society"] = txt
-                    break
-
-    logger.info(
-        f"IMO {imo} | Equasis: name={result.get('vessel_name')} "
-        f"owner={result.get('equasis_owner')} flag={result.get('Flag')}"
-    )
-    return result
 
 @app.get("/equasis/{imo}")
 def equasis_vessel(imo: str, request: Request):
     _check_auth(request, imo)
-
     if not validate_imo(imo):
-        logger.warning(f"Equasis: invalid IMO rejected: {imo}")
         raise HTTPException(status_code=400, detail="Invalid IMO number")
-
     try:
-        data = scrape_equasis(imo)
+        session = _equasis_session()
+        data    = _scrape_equasis(imo, session)
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Equasis scrape failed for IMO {imo}: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Equasis scrape failed: {str(e)}")
-
-    if not data.get("found"):
-        raise HTTPException(status_code=404, detail="Vessel not found on Equasis")
-
+        raise HTTPException(status_code=502, detail=f"Equasis scrape failed: {e}")
     return data
 
 # ============================================================
-# SOF — STATEMENT OF FACTS GENERATOR
+# SOF GENERATOR
 # ============================================================
 
-DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+DAYS = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 class SOFRow(BaseModel):
     date:    Optional[str] = ''
@@ -952,14 +1009,14 @@ class SOFRow(BaseModel):
 
 class SOFData(BaseModel):
     agent:             Optional[str] = ''
-    operation_type:    Optional[str] = 'import'
     vessel:            Optional[str] = ''
     port:              Optional[str] = ''
     owners:            Optional[str] = ''
     cargo:             Optional[str] = ''
     bl_weight:         Optional[str] = ''
     bl_number:         Optional[str] = ''
-    nor_accepted:      Optional[str] = 'AS PER TERMS AND CONDITIONS OF THE RELEVENT C/P.'
+    operation_type:    Optional[str] = ''
+    nor_accepted:      Optional[str] = ''
     port_hours:        Optional[str] = ''
     general_remarks:   Optional[str] = ''
     remarks:           Optional[str] = ''
@@ -1055,7 +1112,7 @@ async def sof_generate(data: SOFData, request: Request):
             '{{SAILING_DATE}} at {{SAILING_TIME}} hr':           fmt_dt(data.sailing_date,      data.sailing_time),
             '{{EOSP_DATE}} at {{EOSP_TIME}} hr':                 fmt_dt(data.eosp_date,         data.eosp_time),
             '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':     fmt_dt(data.nor_tender_date,   data.nor_tender_time),
-            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr':   fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
+            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_WEIGH_TIME}} hr':  fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
             '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
             '{{PILOT_DATE}} at {{PILOT_TIME}} hr':               fmt_dt(data.pilot_date,        data.pilot_time),
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",

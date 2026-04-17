@@ -809,6 +809,34 @@ def vessel_full(imo: str, request: Request):
 
     return data
 
+@app.get("/equasis/{imo}")
+def equasis_endpoint(imo: str, request: Request):
+    # Optional: Keep your auth check if your Enricher script uses X-API-Secret
+    _check_auth(request, imo)
+
+    if not validate_imo(imo):
+        logger.warning(f"Invalid IMO rejected: {imo}")
+        raise HTTPException(status_code=400, detail="Invalid IMO number")
+
+    try:
+        # Step 1: Perform the Equasis Login to get a valid session
+        session = _equasis_session()
+        
+        # Step 2: Run your scraper logic
+        data = _scrape_equasis(imo, session)
+        
+        return data
+
+    except ConnectionRefusedError as e:
+        # This catches the Oracle IP Block / Redirect we added earlier
+        logger.error(f"Equasis Blocked: {e}")
+        raise HTTPException(status_code=403, detail=str(e))
+    except HTTPException as he:
+        # Passes through the 401 login failure from _equasis_session
+        raise he
+    except Exception as e:
+        logger.error(f"Equasis scrape failed for IMO {imo}: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail=f"Equasis scrape failed: {str(e)}")
 
 @app.get("/port-calls/{imo}")
 def port_calls_endpoint(imo: str, request: Request, mmsi: str = ""):

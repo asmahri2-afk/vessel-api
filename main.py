@@ -901,49 +901,44 @@ def vessel_batch(body: BatchRequest, request: Request):
 # ============================================================
 # EQUASIS SCRAPER
 # ============================================================
-
-EQUASIS_LOGIN_URL  = "https://www.equasis.org/EquasisWeb/authen/HomePage"
-EQUASIS_VESSEL_URL = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
+EQUASIS_HOMEPAGE_URL   = "https://www.equasis.org/EquasisWeb/public/HomePage"
+EQUASIS_LOGIN_POST_URL = "https://www.equasis.org/EquasisWeb/authen/HomePage?fs=HomePage"
+EQUASIS_VESSEL_URL     = "https://www.equasis.org/EquasisWeb/restricted/ShipInfo"
 
 def _equasis_session() -> requests.Session:
     if not EQUASIS_EMAIL or not EQUASIS_PASSWORD:
         raise HTTPException(status_code=503, detail="Equasis credentials not configured")
-
     session = requests.Session()
     session.headers.update(_make_headers(referer="https://www.equasis.org/"))
 
-    login_page = session.get(EQUASIS_LOGIN_URL, timeout=15)
+    # Step 1: GET the public homepage to establish JSESSIONID + grab CSRF token
+    login_page = session.get(EQUASIS_HOMEPAGE_URL, timeout=15)
     login_page.raise_for_status()
-
     login_soup = BeautifulSoup(login_page.text, "html.parser")
     token_input = login_soup.find("input", {"name": "j_token"})
     token = token_input["value"] if token_input else ""
 
+    # Step 2: POST credentials to the authen endpoint
     login_data = {
         "j_token":    token,
         "j_email":    EQUASIS_EMAIL,
         "j_password": EQUASIS_PASSWORD,
         "submit":     "Login",
     }
-    login_resp = session.post(EQUASIS_LOGIN_URL, data=login_data, timeout=15)
+    login_resp = session.post(EQUASIS_LOGIN_POST_URL, data=login_data, timeout=15)
     login_resp.raise_for_status()
-
     if "logout" not in login_resp.text.lower() and "j_password" in login_resp.text.lower():
         raise HTTPException(status_code=401, detail="Equasis login failed — check credentials")
-
     return session
 
 def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
     params = {"P_IMO": imo}
     resp   = session.get(EQUASIS_VESSEL_URL, params=params, timeout=20)
     resp.raise_for_status()
-
     soup = BeautifulSoup(resp.text, "html.parser")
-
     # Vessel name
     name_el = soup.select_one("div.title-vessel h2") or soup.select_one("h2.title-vessel")
     name    = name_el.get_text(strip=True) if name_el else ""
-
     # Key info table
     info: Dict[str, str] = {}
     for row in soup.select("table.table-condensed tr"):
@@ -953,7 +948,6 @@ def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
             val = cells[1].get_text(strip=True)
             if key:
                 info[key] = val
-
     # P&I / class / inspections
     pi_club = ""
     for label in soup.find_all(string=re.compile(r"P&I", re.I)):
@@ -963,7 +957,6 @@ def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
             if sib:
                 pi_club = sib.get_text(strip=True)
                 break
-
     return {
         "imo":          imo,
         "name":         name,

@@ -811,7 +811,7 @@ def vessel_full(imo: str, request: Request):
 
 @app.get("/equasis/{imo}")
 def equasis_endpoint(imo: str, request: Request):
-    # Optional: Keep your auth check if your Enricher script uses X-API-Secret
+    # 1. Auth Check (Ensure your curl includes -H "X-API-Secret: your_secret")
     _check_auth(request, imo)
 
     if not validate_imo(imo):
@@ -819,24 +819,34 @@ def equasis_endpoint(imo: str, request: Request):
         raise HTTPException(status_code=400, detail="Invalid IMO number")
 
     try:
-        # Step 1: Perform the Equasis Login to get a valid session
+        # 2. Get the authenticated session
+        # Make sure EQUASIS_EMAIL and EQUASIS_PASSWORD are in your .env
         session = _equasis_session()
         
-        # Step 2: Run your scraper logic
+        # 3. Add mandatory headers to bypass simple bot checks
+        session.headers.update({
+            "Referer": "https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search",
+            "Origin": "https://www.equasis.org"
+        })
+
+        # 4. Run the scraper logic
         data = _scrape_equasis(imo, session)
+
+        # 5. Check if we actually got data or just the 196-byte redirect
+        if not data.get("name") and not data.get("mmsi"):
+             logger.error(f"Oracle IP Blocked for IMO {imo} (Empty Data / Redirected)")
+             raise HTTPException(
+                 status_code=403, 
+                 detail="Equasis blocked the request (Oracle Cloud IP range). Use a proxy or check session."
+             )
         
         return data
 
-    except ConnectionRefusedError as e:
-        # This catches the Oracle IP Block / Redirect we added earlier
-        logger.error(f"Equasis Blocked: {e}")
-        raise HTTPException(status_code=403, detail=str(e))
     except HTTPException as he:
-        # Passes through the 401 login failure from _equasis_session
         raise he
     except Exception as e:
-        logger.error(f"Equasis scrape failed for IMO {imo}: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Equasis scrape failed: {str(e)}")
+        logger.error(f"Equasis Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/port-calls/{imo}")
 def port_calls_endpoint(imo: str, request: Request, mmsi: str = ""):

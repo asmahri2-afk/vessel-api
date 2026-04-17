@@ -933,135 +933,107 @@ def _equasis_session() -> requests.Session:
 
 def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
     params = {"P_IMO": imo}
-    resp   = session.get(EQUASIS_VESSEL_URL, params=params, timeout=20)
+    # Equasis often expects a specific Referer to allow the search
+    headers = {
+        "Referer": "https://www.equasis.org/EquasisWeb/restricted/Search?fs=Search"
+    }
+    
+    resp = session.get(EQUASIS_VESSEL_URL, params=params, headers=headers, timeout=20)
     resp.raise_for_status()
+
+    # --- BLOCK/REDIRECT DETECTION ---
+    # If content is tiny or contains "Login", the session is dead or Oracle IP is blocked.
+    if len(resp.text) < 1000 or "Login" in resp.text or "Restricted" in resp.text:
+        # We raise a custom error so your loop can catch it and re-login
+        raise ConnectionRefusedError(f"Equasis session expired or IP blocked (Response size: {len(resp.text)}b)")
+
     soup = BeautifulSoup(resp.text, "html.parser")
 
     # ─────────────────────────────────────────────────────────────────────
-    # Vessel name — lives in <h4> as "GRACE LOUISE- IMO n°9913523"
+    # Vessel name — Robust extraction
     # ─────────────────────────────────────────────────────────────────────
     name = ""
+    # Primary: Find in H4
     for h4 in soup.find_all("h4"):
         txt = h4.get_text(strip=True)
         if "IMO" in txt and imo in txt:
             name = re.split(r"\s*IMO", txt, flags=re.I)[0].strip().rstrip("-").strip()
             break
+    
+    # Secondary: Fallback to page title if H4 parsing fails
+    if not name:
+        title = soup.title.string if soup.title else ""
+        if title and "Equasis" in title and "-" in title:
+            name = title.split("-")[0].strip()
 
     # ─────────────────────────────────────────────────────────────────────
-    # Bootstrap-grid key/value fields (Flag, GT, DWT, Type, Year, MMSI, etc.)
-    # Each field = <div class="row"> with <b>Label</b> in col 1, value in col 2
+    # Bootstrap-grid key/value fields
     # ─────────────────────────────────────────────────────────────────────
     info: Dict[str, str] = {}
     for b in soup.find_all("b"):
         label = b.get_text(strip=True).rstrip(":")
-        if not label:
-            continue
-        label_col = b.find_parent("div", class_=re.compile(r"\bcol-"))
-        if not label_col:
-            continue
-        row = label_col.find_parent("div", class_=re.compile(r"\brow\b"))
-        if not row:
-            continue
-        cols = row.find_all("div", class_=re.compile(r"\bcol-"), recursive=False)
-        try:
-            idx = cols.index(label_col)
-        except ValueError:
-            continue
-        if idx + 1 >= len(cols):
-            continue
-        value_col = cols[idx + 1]
+        if not label: continue
+        
+        # Using a more direct col-sibling approach for Bootstrap layouts
+        label_col = b.find_parent("div", class_=re.compile(r"col-"))
+        if not label_col: continue
+        
+        # Try to find the immediate next sibling div (the value column)
+        value_col = label_col.find_next_sibling("div", class_=re.compile(r"col-"))
+        if not value_col: continue
 
         val_text = value_col.get_text(strip=True)
+        
+        # Flag logic (Icon detection)
         if not val_text:
             img = value_col.find("img")
             if img and img.get("src"):
                 m = re.search(r"/([A-Z]{2,3})\.(?:png|gif|jpg)", img["src"], re.I)
-                if m:
-                    val_text = m.group(1).upper()
+                if m: val_text = m.group(1).upper()
 
-        # Flag: combine country code + name "(Singapore)" if present
-        if label.lower().startswith("flag") and idx + 3 < len(cols):
-            country = cols[idx + 3].get_text(strip=True)
-            country = re.sub(r"^\(|\)$", "", country).strip()
-            if country:
-                val_text = f"{val_text} ({country})" if val_text else country
+        # Handle Flag Country (usually in the 3rd column over in the row)
+        if label.lower().startswith("flag"):
+            country_col = value_col.find_next_sibling("div", class_=re.compile(r"col-"))
+            if country_col:
+                country = re.sub(r"^\(|\)$", "", country_col.get_text(strip=True)).strip()
+                if country:
+                    val_text = f"{val_text} ({country})" if val_text else country
 
         if val_text:
             info[label] = val_text
 
     # ─────────────────────────────────────────────────────────────────────
     # Companies table — find row with role = "Registered owner"
-    # Columns: IMO | Role | Name of company | Address | Date of effect | Details
     # ─────────────────────────────────────────────────────────────────────
-    equasis_owner   = ""
+    equasis_owner = ""
     equasis_address = ""
     for table in soup.find_all("table"):
         rows = table.find_all("tr")
-        if not rows:
-            continue
-        # Check header — must have Role + Name of company + Address
+        if not rows: continue
+        
         headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th", "td"])]
-        if not ("role" in " ".join(headers) and "address" in " ".join(headers)):
-            continue
-        # Find column positions
+        if not any(h in " ".join(headers) for h in ["role", "address"]): continue
+
         try:
-            i_role    = next(i for i, h in enumerate(headers) if "role" in h)
-            i_name    = next(i for i, h in enumerate(headers) if "name" in h and "compan" in h)
+            i_role = next(i for i, h in enumerate(headers) if "role" in h)
+            i_name = next(i for i, h in enumerate(headers) if "name" in h and "compan" in h)
             i_address = next(i for i, h in enumerate(headers) if "address" in h)
-        except StopIteration:
-            continue
+        except StopIteration: continue
 
         for tr in rows[1:]:
             cells = tr.find_all(["td", "th"])
-            if len(cells) <= max(i_role, i_name, i_address):
-                continue
+            if len(cells) <= max(i_role, i_name, i_address): continue
+            
             role = cells[i_role].get_text(strip=True).lower()
             if "registered owner" in role:
-                equasis_owner   = cells[i_name].get_text(strip=True)
+                equasis_owner = cells[i_name].get_text(strip=True)
                 equasis_address = cells[i_address].get_text(strip=True)
                 break
-        if equasis_owner:
-            break
+        if equasis_owner: break
 
     # ─────────────────────────────────────────────────────────────────────
-    # Classification society — table with "Classification society" header
+    # Final Result Construction
     # ─────────────────────────────────────────────────────────────────────
-    class_society = ""
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
-        if not rows:
-            continue
-        headers = [th.get_text(strip=True).lower() for th in rows[0].find_all(["th", "td"])]
-        header_str = " ".join(headers)
-        if "classification society" not in header_str:
-            continue
-        try:
-            i_soc = next(i for i, h in enumerate(headers) if "classification society" in h)
-        except StopIteration:
-            continue
-        # Take the first data row (most recent / active classification)
-        for tr in rows[1:]:
-            cells = tr.find_all(["td", "th"])
-            if len(cells) > i_soc:
-                class_society = cells[i_soc].get_text(strip=True)
-                if class_society:
-                    break
-        if class_society:
-            break
-
-    # ─────────────────────────────────────────────────────────────────────
-    # P&I Club — try grid first, fall back to label text search
-    # ─────────────────────────────────────────────────────────────────────
-    pi_club = info.get("P&I Club") or info.get("P&I club") or ""
-    if not pi_club:
-        for label in soup.find_all(string=re.compile(r"P&I", re.I)):
-            parent = label.find_parent(["td", "div", "span"])
-            if parent:
-                sib = parent.find_next_sibling(["td", "div", "span"])
-                if sib:
-                    pi_club = sib.get_text(strip=True)
-                    break
-
     return {
         "imo":             imo,
         "name":            name,
@@ -1074,8 +1046,8 @@ def _scrape_equasis(imo: str, session: requests.Session) -> Dict[str, Any]:
         "mmsi":            info.get("MMSI"),
         "equasis_owner":   equasis_owner,
         "equasis_address": equasis_address,
-        "class_society":   class_society,
-        "pi_club":         pi_club,
+        "class_society":   info.get("Classification society") or "",
+        "pi_club":         info.get("P&I Club") or info.get("P&I club") or "",
         "raw_info":        info,
     }
 

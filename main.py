@@ -1210,7 +1210,7 @@ async def sof_generate(data: SOFData, request: Request):
             '{{SAILING_DATE}} at {{SAILING_TIME}} hr':           fmt_dt(data.sailing_date,      data.sailing_time),
             '{{EOSP_DATE}} at {{EOSP_TIME}} hr':                 fmt_dt(data.eosp_date,         data.eosp_time),
             '{{NOR_TENDER_DATE}} at {{NOR_TENDER_TIME}} hr':     fmt_dt(data.nor_tender_date,   data.nor_tender_time),
-            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_WEIGH_TIME}} hr':  fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
+            '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr':  fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
             '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
             '{{PILOT_DATE}} at {{PILOT_TIME}} hr':               fmt_dt(data.pilot_date,        data.pilot_time),
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",

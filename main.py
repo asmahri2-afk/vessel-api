@@ -1382,6 +1382,33 @@ class DossierRequest(BaseModel):
         return super().model_validate(obj, *args, **kwargs)
 
 
+
+def _dossier_prevent_table_break(doc):
+    """Prevent table rows from splitting across pages after placeholder fill."""
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    for table in doc.tables:
+        # Set table-level property: no split across pages
+        tbl  = table._tbl
+        tblPr = tbl.find(qn('w:tblPr'))
+        if tblPr is None:
+            tblPr = OxmlElement('w:tblPr')
+            tbl.insert(0, tblPr)
+        # Per-row: cantSplit = keep row on one page
+        for row in table.rows:
+            tr   = row._tr
+            trPr = tr.find(qn('w:trPr'))
+            if trPr is None:
+                trPr = OxmlElement('w:trPr')
+                tr.insert(0, trPr)
+            # Remove any existing cantSplit then re-add as val=1
+            for old in trPr.findall(qn('w:cantSplit')):
+                trPr.remove(old)
+            cant = OxmlElement('w:cantSplit')
+            cant.set(qn('w:val'), '1')
+            trPr.append(cant)
+
+
 def _dossier_replace_paragraph(para, replacements: Dict[str, str]):
     """Replace {{tag}} placeholders in a paragraph, handling split runs."""
     full = "".join(r.text for r in para.runs)
@@ -1491,6 +1518,7 @@ async def dossier_generate(req: DossierRequest, request: Request):
                 try:
                     doc = Document(io.BytesIO(docx_bytes))
                     _dossier_replace_doc(doc, replacements)
+                    _dossier_prevent_table_break(doc)
                     out = io.BytesIO()
                     doc.save(out)
                     out.seek(0)

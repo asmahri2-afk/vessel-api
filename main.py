@@ -1383,11 +1383,18 @@ class DossierRequest(BaseModel):
 
 
 
-
 def _dossier_prevent_table_break(doc):
-    """Prevent table rows from splitting across pages after placeholder fill."""
+    """
+    Fix table row page overflow:
+    1. Change trHeight rule from 'atLeast' to 'exact' — locks row at its
+       template height so it never grows beyond the page.
+    2. Set cantSplit so rows are never split across pages.
+    This preserves all empty spacer paragraphs (stamp areas like A G E N T
+    and M A S T E R stay in their intended positions).
+    """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+
     for table in doc.tables:
         for row in table.rows:
             tr   = row._tr
@@ -1395,6 +1402,14 @@ def _dossier_prevent_table_break(doc):
             if trPr is None:
                 trPr = OxmlElement('w:trPr')
                 tr.insert(0, trPr)
+
+            # Lock row height to exact so it never grows past the page
+            trH = trPr.find(qn('w:trHeight'))
+            if trH is not None:
+                trH.set(qn('w:hRule'), 'exact')
+            # If no height set, leave auto (short header rows are fine)
+
+            # cantSplit — never split a row across pages
             for old in trPr.findall(qn('w:cantSplit')):
                 trPr.remove(old)
             cant = OxmlElement('w:cantSplit')
@@ -1403,36 +1418,13 @@ def _dossier_prevent_table_break(doc):
 
 
 def _dossier_trim_cell_paragraphs(doc, keep_trailing: int = 3):
-    """
-    Trim excess empty trailing paragraphs from table cells.
-    Templates use many empty paragraphs as form spacers — after fill these
-    make rows taller than a page, causing overflow even with cantSplit=True.
-    """
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                paras = cell.paragraphs
-                if len(paras) <= keep_trailing + 1:
-                    continue
-                last_filled = -1
-                for i, p in enumerate(paras):
-                    if p.text.strip():
-                        last_filled = i
-                keep_until = last_filled + keep_trailing + 1
-                if keep_until >= len(paras):
-                    continue
-                tc = cell._tc
-                NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
-                all_p = tc.findall(f'.//{{{NS}}}p')
-                for p_elem in all_p[keep_until:]:
-                    text = ''.join(
-                        r.text or ''
-                        for r in p_elem.findall(f'.//{{{NS}}}t')
-                    ).strip()
-                    if not text:
-                        parent = p_elem.getparent()
-                        if parent is not None:
-                            parent.remove(p_elem)
+    """Stub — layout preserved via exact row height in _dossier_prevent_table_break."""
+    pass
+
+
+def _dossier_smart_trim_cells(doc, max_consecutive_empty: int = 1):
+    """Stub — layout preserved via exact row height in _dossier_prevent_table_break."""
+    pass
 
 
 def _dossier_replace_paragraph(para, replacements: Dict[str, str]):
@@ -1544,7 +1536,6 @@ async def dossier_generate(req: DossierRequest, request: Request):
                 try:
                     doc = Document(io.BytesIO(docx_bytes))
                     _dossier_replace_doc(doc, replacements)
-                    _dossier_trim_cell_paragraphs(doc)
                     _dossier_prevent_table_break(doc)
                     out = io.BytesIO()
                     doc.save(out)

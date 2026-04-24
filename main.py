@@ -17,6 +17,8 @@ from pydantic import BaseModel
 from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Border, Side, PatternFill, Alignment
+import zipfile
+from docx import Document
 
 # ============================================================
 # LOGGING
@@ -1316,3 +1318,207 @@ async def sof_generate(data: SOFData, request: Request):
     except Exception as e:
         logger.error(f"SOF generation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"SOF generation failed: {str(e)}")
+
+
+# ============================================================
+# DOSSIER GENERATOR
+# ============================================================
+
+DOSSIER_PAGES_BASE = "https://vesseltracker.pages.dev/port-docs"
+
+DOSSIER_TEMPLATE_FILES = {
+    "tva-anp":                "tva-anp.docx",
+    "tva-marsa":              "tva-marsa.docx",
+    "pilotage":               "pilotage.docx",
+    "gardiennage":            "gardiennage.docx",
+    "timesheet":              "timesheet.docx",
+    "manifest-import-entree": "manifest-import-entree.docx",
+    "manifest-import-sortie": "manifest-import-sortie.docx",
+    "manifest-export-entree": "manifest-export-entree.docx",
+    "manifest-export-sortie": "manifest-export-sortie.docx",
+    "declaration-import":     "declaration-import.docx",
+    "declaration-export":     "declaration-export.docx",
+    "overtime":               "overtime.docx",
+    "stowaway":               "stowaway.docx",
+}
+
+class DossierRequest(BaseModel):
+    imo:            str
+    port:           str
+    operation:      Optional[str] = "import"
+    templates:      List[str]
+    vessel_name:    Optional[str] = ""
+    flag:           Optional[str] = ""
+    loa:            Optional[str] = ""
+    deadweight:     Optional[str] = ""
+    gross_tonnage:  Optional[str] = ""
+    owner:          Optional[str] = ""
+    cargo:          Optional[str] = ""
+    bl_weight:      Optional[str] = ""
+    shipper:        Optional[str] = ""
+    notify:         Optional[str] = ""
+    from_port:      Optional[str] = ""   # mapped from "from" key in JSON
+    to_port:        Optional[str] = ""   # mapped from "to" key in JSON
+    bc:             Optional[str] = ""
+    arrival_date:   Optional[str] = ""
+    berthing_date:  Optional[str] = ""
+    departure_date: Optional[str] = ""
+    date:           Optional[str] = ""
+    today_date:     Optional[str] = ""
+    agent_count:    Optional[str] = ""
+    ste_garde:      Optional[str] = ""
+    expimp:         Optional[str] = ""
+    shift:          Optional[str] = ""
+
+    @classmethod
+    def model_validate(cls, obj, *args, **kwargs):
+        """Map JSON keys 'from' and 'to' to 'from_port' and 'to_port'."""
+        if isinstance(obj, dict):
+            obj = dict(obj)
+            if "from" in obj:
+                obj["from_port"] = obj.pop("from")
+            if "to" in obj and "to_port" not in obj:
+                obj["to_port"] = obj.pop("to")
+        return super().model_validate(obj, *args, **kwargs)
+
+
+def _dossier_replace_paragraph(para, replacements: Dict[str, str]):
+    """Replace {{tag}} placeholders in a paragraph, handling split runs."""
+    full = "".join(r.text for r in para.runs)
+    new  = full
+    for tag, val in replacements.items():
+        new = new.replace(f"{{{{{tag}}}}}", val)
+    if new == full:
+        return
+    if para.runs:
+        para.runs[0].text = new
+        for run in para.runs[1:]:
+            run.text = ""
+
+
+def _dossier_replace_doc(doc: Document, replacements: Dict[str, str]):
+    """Replace in body paragraphs, tables, headers and footers."""
+    for para in doc.paragraphs:
+        _dossier_replace_paragraph(para, replacements)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _dossier_replace_paragraph(para, replacements)
+    for section in doc.sections:
+        for para in section.header.paragraphs:
+            _dossier_replace_paragraph(para, replacements)
+        for para in section.footer.paragraphs:
+            _dossier_replace_paragraph(para, replacements)
+
+
+def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:
+    today = req.today_date or datetime.now().strftime("%d/%m/%Y")
+    date  = req.date or today
+    # Friendly port label
+    port_label = req.port.replace("-anch", " Anch.").replace("-", " ").title()
+    return {
+        "vessel_name":    req.vessel_name  or "",
+        "imo":            req.imo          or "",
+        "flag":           req.flag         or "",
+        "loa":            req.loa          or "",
+        "deadweight":     req.deadweight   or "",
+        "gross_tonnage":  req.gross_tonnage or "",
+        "owner":          req.owner        or "",
+        "cargo":          req.cargo        or "",
+        "bl_weight":      req.bl_weight    or "",
+        "shipper":        req.shipper      or "",
+        "notify":         req.notify       or "",
+        "from":           req.from_port    or "",
+        "to":             req.to_port      or "",
+        "bc":             req.bc           or "",
+        "arrival_date":   req.arrival_date  or "",
+        "berthing_date":  req.berthing_date or "",
+        "departure_date": req.departure_date or "",
+        "date":           date,
+        "today_date":     today,
+        "port":           port_label,
+        "agent_count":    req.agent_count  or "",
+        "ste_garde":      req.ste_garde    or "",
+        "expimp":         req.expimp or (req.operation or "import").title(),
+        "shift":          req.shift        or "",
+    }
+
+
+@app.post("/dossier/generate")
+async def dossier_generate(req: DossierRequest, request: Request):
+    """
+    Download selected .docx templates from Cloudflare Pages,
+    fill {{placeholders}}, bundle into a zip, return zip bytes.
+    """
+    if API_SECRET:
+        client_secret = request.headers.get("X-API-Secret", "")
+        if client_secret != API_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+    if not req.templates:
+        raise HTTPException(status_code=400, detail="No templates selected")
+    if not req.port:
+        raise HTTPException(status_code=400, detail="Port is required")
+
+    replacements = _dossier_build_replacements(req)
+    logger.info(
+        f"Dossier generate | IMO {req.imo} | port={req.port} "
+        f"| templates={req.templates}"
+    )
+
+    zip_buffer  = io.BytesIO()
+    errors: List[str] = []
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for tpl_id in req.templates:
+                filename = DOSSIER_TEMPLATE_FILES.get(tpl_id)
+                if not filename:
+                    errors.append(f"Unknown template: {tpl_id}")
+                    continue
+
+                url = f"{DOSSIER_PAGES_BASE}/{req.port}/{filename}"
+                try:
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    docx_bytes = r.content
+                except Exception as e:
+                    logger.warning(f"Failed to fetch template {filename}: {e}")
+                    errors.append(f"Could not fetch {filename}: {e}")
+                    continue
+
+                try:
+                    doc = Document(io.BytesIO(docx_bytes))
+                    _dossier_replace_doc(doc, replacements)
+                    out = io.BytesIO()
+                    doc.save(out)
+                    out.seek(0)
+                    zf.writestr(filename, out.read())
+                    logger.info(f"Filled {filename}")
+                except Exception as e:
+                    logger.error(f"Error filling {filename}: {e}", exc_info=True)
+                    errors.append(f"Error filling {filename}: {e}")
+
+    zip_buffer.seek(0)
+    zip_bytes = zip_buffer.read()
+
+    if not zip_bytes or len(zip_bytes) < 50:
+        detail = "No documents generated."
+        if errors:
+            detail += " Errors: " + "; ".join(errors)
+        raise HTTPException(status_code=500, detail=detail)
+
+    if errors:
+        logger.warning(f"Dossier completed with {len(errors)} error(s): {errors}")
+
+    vessel_slug = re.sub(r"\s+", "_", (req.vessel_name or "VESSEL").upper())
+    port_slug   = req.port.upper().replace("-", "_")
+    date_slug   = datetime.now().strftime("%Y%m%d")
+    out_filename = f"DOSSIER_{vessel_slug}_{port_slug}_{date_slug}.zip"
+
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{out_filename}"'},
+    )

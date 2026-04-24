@@ -1383,30 +1383,56 @@ class DossierRequest(BaseModel):
 
 
 
+
 def _dossier_prevent_table_break(doc):
     """Prevent table rows from splitting across pages after placeholder fill."""
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
     for table in doc.tables:
-        # Set table-level property: no split across pages
-        tbl  = table._tbl
-        tblPr = tbl.find(qn('w:tblPr'))
-        if tblPr is None:
-            tblPr = OxmlElement('w:tblPr')
-            tbl.insert(0, tblPr)
-        # Per-row: cantSplit = keep row on one page
         for row in table.rows:
             tr   = row._tr
             trPr = tr.find(qn('w:trPr'))
             if trPr is None:
                 trPr = OxmlElement('w:trPr')
                 tr.insert(0, trPr)
-            # Remove any existing cantSplit then re-add as val=1
             for old in trPr.findall(qn('w:cantSplit')):
                 trPr.remove(old)
             cant = OxmlElement('w:cantSplit')
             cant.set(qn('w:val'), '1')
             trPr.append(cant)
+
+
+def _dossier_trim_cell_paragraphs(doc, keep_trailing: int = 3):
+    """
+    Trim excess empty trailing paragraphs from table cells.
+    Templates use many empty paragraphs as form spacers — after fill these
+    make rows taller than a page, causing overflow even with cantSplit=True.
+    """
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paras = cell.paragraphs
+                if len(paras) <= keep_trailing + 1:
+                    continue
+                last_filled = -1
+                for i, p in enumerate(paras):
+                    if p.text.strip():
+                        last_filled = i
+                keep_until = last_filled + keep_trailing + 1
+                if keep_until >= len(paras):
+                    continue
+                tc = cell._tc
+                NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'
+                all_p = tc.findall(f'.//{{{NS}}}p')
+                for p_elem in all_p[keep_until:]:
+                    text = ''.join(
+                        r.text or ''
+                        for r in p_elem.findall(f'.//{{{NS}}}t')
+                    ).strip()
+                    if not text:
+                        parent = p_elem.getparent()
+                        if parent is not None:
+                            parent.remove(p_elem)
 
 
 def _dossier_replace_paragraph(para, replacements: Dict[str, str]):
@@ -1518,6 +1544,7 @@ async def dossier_generate(req: DossierRequest, request: Request):
                 try:
                     doc = Document(io.BytesIO(docx_bytes))
                     _dossier_replace_doc(doc, replacements)
+                    _dossier_trim_cell_paragraphs(doc)
                     _dossier_prevent_table_break(doc)
                     out = io.BytesIO()
                     doc.save(out)

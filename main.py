@@ -112,10 +112,6 @@ app.add_middleware(
 class BatchRequest(BaseModel):
     imos: List[str]
 
-class CargoItem(BaseModel):
-    description: str
-    weight: str
-    
 # ============================================================
 # UTILITY HELPERS
 # ============================================================
@@ -1346,6 +1342,10 @@ DOSSIER_TEMPLATE_FILES = {
     "stowaway":               "stowaway.docx",
 }
 
+class CargoItem(BaseModel):
+    description: str
+    weight: str
+
 class DossierRequest(BaseModel):
     imo:            str
     port:           str
@@ -1362,8 +1362,8 @@ class DossierRequest(BaseModel):
     cargo_items:    Optional[List[CargoItem]] = []   # new multi-cargo field
     shipper:        Optional[str] = ""
     notify:         Optional[str] = ""
-    from_port:      Optional[str] = ""
-    to_port:        Optional[str] = ""
+    from_port:      Optional[str] = ""   # mapped from "from" key in JSON
+    to_port:        Optional[str] = ""   # mapped from "to" key in JSON
     bc:             Optional[str] = ""
     arrival_date:   Optional[str] = ""
     berthing_date:  Optional[str] = ""
@@ -1388,7 +1388,7 @@ class DossierRequest(BaseModel):
 
 
 # ============================================================
-# DOSSIER GENERATOR – FIXED FUNCTIONS (3 fixes)
+# DOSSIER GENERATOR – FIXED FUNCTIONS
 # ============================================================
 
 def _dossier_replace_paragraph(para, replacements):
@@ -1397,6 +1397,10 @@ def _dossier_replace_paragraph(para, replacements):
     breaks) and <w:tab/> (tabs) so multi-line stamp areas like A G E N T /
     M A S T E R keep their vertical layout. Also handles tags split across
     multiple runs.
+
+    **NEW**: Converts any newline character (`\n`) in the replacement value
+    into a proper Word line break (`<w:br/>`) so that each cargo item appears
+    on a separate line inside a table cell.
     """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
@@ -1404,7 +1408,8 @@ def _dossier_replace_paragraph(para, replacements):
     if not para.runs:
         return
 
-    BR  = "\uE000"
+    # Use private Unicode markers for <w:br/> and <w:tab/> that already exist
+    BR = "\uE000"
     TAB = "\uE001"
 
     W_T   = qn('w:t')
@@ -1412,6 +1417,7 @@ def _dossier_replace_paragraph(para, replacements):
     W_TAB = qn('w:tab')
     W_CR  = qn('w:cr')
 
+    # Collect existing runs and their special elements
     parts = []
     for run in para.runs:
         for child in run._element:
@@ -1423,13 +1429,17 @@ def _dossier_replace_paragraph(para, replacements):
                 parts.append(TAB)
     full = "".join(parts)
 
+    # Replace all placeholders
     new = full
     for tag, val in replacements.items():
-        new = new.replace(f"{{{{{tag}}}}}", val if val is not None else '')
+        if val is None:
+            val = ''
+        new = new.replace(f"{{{{{tag}}}}}", val)
 
     if new == full:
         return
 
+    # Clear existing content (text, breaks, tabs)
     for run in para.runs:
         for child in list(run._element):
             if child.tag in (W_T, W_BR, W_TAB, W_CR):
@@ -1438,7 +1448,7 @@ def _dossier_replace_paragraph(para, replacements):
     first_r = para.runs[0]._element
     buf = []
 
-    def _flush_text():
+    def flush_text():
         if not buf:
             return
         t = OxmlElement('w:t')
@@ -1449,14 +1459,18 @@ def _dossier_replace_paragraph(para, replacements):
 
     for ch in new:
         if ch == BR:
-            _flush_text()
+            flush_text()
             first_r.append(OxmlElement('w:br'))
         elif ch == TAB:
-            _flush_text()
+            flush_text()
             first_r.append(OxmlElement('w:tab'))
+        elif ch == '\n':
+            # Convert newline to line break
+            flush_text()
+            first_r.append(OxmlElement('w:br'))
         else:
             buf.append(ch)
-    _flush_text()
+    flush_text()
 
 
 def _dossier_replace_doc(doc, replacements):

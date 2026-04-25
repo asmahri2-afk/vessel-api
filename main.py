@@ -112,6 +112,10 @@ app.add_middleware(
 class BatchRequest(BaseModel):
     imos: List[str]
 
+class CargoItem(BaseModel):
+    description: str
+    weight: str
+    
 # ============================================================
 # UTILITY HELPERS
 # ============================================================
@@ -1353,12 +1357,13 @@ class DossierRequest(BaseModel):
     deadweight:     Optional[str] = ""
     gross_tonnage:  Optional[str] = ""
     owner:          Optional[str] = ""
-    cargo:          Optional[str] = ""
-    bl_weight:      Optional[str] = ""
+    cargo:          Optional[str] = ""           # kept for compatibility
+    bl_weight:      Optional[str] = ""           # kept for compatibility
+    cargo_items:    Optional[List[CargoItem]] = []   # new multi-cargo field
     shipper:        Optional[str] = ""
     notify:         Optional[str] = ""
-    from_port:      Optional[str] = ""   # mapped from "from" key in JSON
-    to_port:        Optional[str] = ""   # mapped from "to" key in JSON
+    from_port:      Optional[str] = ""
+    to_port:        Optional[str] = ""
     bc:             Optional[str] = ""
     arrival_date:   Optional[str] = ""
     berthing_date:  Optional[str] = ""
@@ -1529,6 +1534,18 @@ def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:
     date  = req.date or today
     # Friendly port label
     port_label = req.port.replace("-anch", " Anch.").replace("-", " ").title()
+
+    # Build cargo and bl_weight strings from cargo_items if available
+    if req.cargo_items:
+        cargo_str = "\n".join([item.description for item in req.cargo_items if item.description])
+        weight_str = "\n".join([item.weight for item in req.cargo_items if item.weight])
+        # Use the new strings; if empty, fall back to old fields
+        final_cargo = cargo_str or (req.cargo or "")
+        final_bl_weight = weight_str or (req.bl_weight or "")
+    else:
+        final_cargo = req.cargo or ""
+        final_bl_weight = req.bl_weight or ""
+
     return {
         "vessel_name":    req.vessel_name  or "",
         "imo":            req.imo          or "",
@@ -1537,8 +1554,8 @@ def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:
         "deadweight":     req.deadweight   or "",
         "gross_tonnage":  req.gross_tonnage or "",
         "owner":          req.owner        or "",
-        "cargo":          req.cargo        or "",
-        "bl_weight":      req.bl_weight    or "",
+        "cargo":          final_cargo,
+        "bl_weight":      final_bl_weight,
         "shipper":        req.shipper      or "",
         "notify":         req.notify       or "",
         "from":           req.from_port    or "",

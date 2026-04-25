@@ -1382,79 +1382,146 @@ class DossierRequest(BaseModel):
         return super().model_validate(obj, *args, **kwargs)
 
 
+# ============================================================
+# DOSSIER GENERATOR – FIXED FUNCTIONS (3 fixes)
+# ============================================================
+
+def _dossier_replace_paragraph(para, replacements):
+    """
+    Replace {{tag}} placeholders in a paragraph, preserving <w:br/> (line
+    breaks) and <w:tab/> (tabs) so multi-line stamp areas like A G E N T /
+    M A S T E R keep their vertical layout. Also handles tags split across
+    multiple runs.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    if not para.runs:
+        return
+
+    BR  = "\uE000"
+    TAB = "\uE001"
+
+    W_T   = qn('w:t')
+    W_BR  = qn('w:br')
+    W_TAB = qn('w:tab')
+    W_CR  = qn('w:cr')
+
+    parts = []
+    for run in para.runs:
+        for child in run._element:
+            if child.tag == W_T:
+                parts.append(child.text or '')
+            elif child.tag in (W_BR, W_CR):
+                parts.append(BR)
+            elif child.tag == W_TAB:
+                parts.append(TAB)
+    full = "".join(parts)
+
+    new = full
+    for tag, val in replacements.items():
+        new = new.replace(f"{{{{{tag}}}}}", val if val is not None else '')
+
+    if new == full:
+        return
+
+    for run in para.runs:
+        for child in list(run._element):
+            if child.tag in (W_T, W_BR, W_TAB, W_CR):
+                run._element.remove(child)
+
+    first_r = para.runs[0]._element
+    buf = []
+
+    def _flush_text():
+        if not buf:
+            return
+        t = OxmlElement('w:t')
+        t.text = "".join(buf)
+        t.set(qn('xml:space'), 'preserve')
+        first_r.append(t)
+        buf.clear()
+
+    for ch in new:
+        if ch == BR:
+            _flush_text()
+            first_r.append(OxmlElement('w:br'))
+        elif ch == TAB:
+            _flush_text()
+            first_r.append(OxmlElement('w:tab'))
+        else:
+            buf.append(ch)
+    _flush_text()
+
+
+def _dossier_replace_doc(doc, replacements):
+    """
+    Replace placeholders in body paragraphs, table cells, and existing
+    headers/footers.
+
+    CRITICAL: do NOT touch section.header.paragraphs / section.footer.paragraphs
+    unconditionally — python-docx materialises a default empty header/footer
+    just by accessing those properties, which mutates the section XML and
+    adds vertical space that pushes content onto a second page on every render.
+    Check the underlying <w:headerReference>/<w:footerReference> XML first and
+    only descend if a header/footer was actually defined in the template.
+    """
+    from docx.oxml.ns import qn
+
+    H_REF = qn('w:headerReference')
+    F_REF = qn('w:footerReference')
+
+    for para in doc.paragraphs:
+        _dossier_replace_paragraph(para, replacements)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _dossier_replace_paragraph(para, replacements)
+
+    for section in doc.sections:
+        sectPr = section._sectPr
+        if sectPr.find(H_REF) is not None:
+            for para in section.header.paragraphs:
+                _dossier_replace_paragraph(para, replacements)
+        if sectPr.find(F_REF) is not None:
+            for para in section.footer.paragraphs:
+                _dossier_replace_paragraph(para, replacements)
+
 
 def _dossier_prevent_table_break(doc):
     """
-    Fix table row page overflow:
-    1. Change trHeight rule from 'atLeast' to 'exact' — locks row at its
-       template height so it never grows beyond the page.
-    2. Set cantSplit so rows are never split across pages.
-    This preserves all empty spacer paragraphs (stamp areas like A G E N T
-    and M A S T E R stay in their intended positions).
+    Keep table rows from splitting across pages, WITHOUT clipping cell content.
+
+    The previous version forced hRule='atLeast' → 'exact' on every row, which
+    locks the row at its stored minimum height and clips everything beneath.
+    That destroyed the A G E N T / M A S T E R stamp areas.
+
+    Correct behaviour:
+      - Set cantSplit='1' so a row never breaks across pages.
+      - Leave trHeight alone. 'atLeast' is the right rule: rows grow to fit
+        their content, and Word pushes the whole row to the next page only if
+        it physically can't fit on the current one.
     """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
 
     for table in doc.tables:
         for row in table.rows:
-            tr   = row._tr
+            tr = row._tr
             trPr = tr.find(qn('w:trPr'))
             if trPr is None:
                 trPr = OxmlElement('w:trPr')
                 tr.insert(0, trPr)
 
-            # Lock row height to exact so it never grows past the page
-            trH = trPr.find(qn('w:trHeight'))
-            if trH is not None:
-                trH.set(qn('w:hRule'), 'exact')
-            # If no height set, leave auto (short header rows are fine)
-
-            # cantSplit — never split a row across pages
             for old in trPr.findall(qn('w:cantSplit')):
                 trPr.remove(old)
             cant = OxmlElement('w:cantSplit')
             cant.set(qn('w:val'), '1')
             trPr.append(cant)
 
-
-def _dossier_trim_cell_paragraphs(doc, keep_trailing: int = 3):
-    """Stub — layout preserved via exact row height in _dossier_prevent_table_break."""
-    pass
-
-
-def _dossier_smart_trim_cells(doc, max_consecutive_empty: int = 1):
-    """Stub — layout preserved via exact row height in _dossier_prevent_table_break."""
-    pass
-
-
-def _dossier_replace_paragraph(para, replacements: Dict[str, str]):
-    """Replace {{tag}} placeholders in a paragraph, handling split runs."""
-    full = "".join(r.text for r in para.runs)
-    new  = full
-    for tag, val in replacements.items():
-        new = new.replace(f"{{{{{tag}}}}}", val)
-    if new == full:
-        return
-    if para.runs:
-        para.runs[0].text = new
-        for run in para.runs[1:]:
-            run.text = ""
-
-
-def _dossier_replace_doc(doc: Document, replacements: Dict[str, str]):
-    """Replace in body paragraphs, tables, headers and footers."""
-    for para in doc.paragraphs:
-        _dossier_replace_paragraph(para, replacements)
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                for para in cell.paragraphs:
-                    _dossier_replace_paragraph(para, replacements)
-    for section in doc.sections:
-        for para in section.header.paragraphs:
-            _dossier_replace_paragraph(para, replacements)
-        for para in section.footer.paragraphs:
-            _dossier_replace_paragraph(para, replacements)
+            # Intentionally do NOT modify <w:trHeight>.
 
 
 def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:

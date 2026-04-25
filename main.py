@@ -1388,19 +1388,18 @@ class DossierRequest(BaseModel):
 
 
 # ============================================================
-# DOSSIER GENERATOR – FIXED FUNCTIONS
+# DOSSIER GENERATOR – FIXED FUNCTIONS (multi-cargo + pattern replacement)
 # ============================================================
 
 def _dossier_replace_paragraph(para, replacements):
     """
     Replace {{tag}} placeholders in a paragraph, preserving <w:br/> (line
-    breaks) and <w:tab/> (tabs) so multi-line stamp areas like A G E N T /
-    M A S T E R keep their vertical layout. Also handles tags split across
-    multiple runs.
+    breaks) and <w:tab/> (tabs). Converts `\n` to <w:br/>.
 
-    **NEW**: Converts any newline character (`\n`) in the replacement value
-    into a proper Word line break (`<w:br/>`) so that each cargo item appears
-    on a separate line inside a table cell.
+    Special handling: if the paragraph contains the exact pattern
+    "{{cargo}} : {{bl_weight}}" (with optional spaces), we replace it with
+    a single {{cargo}} placeholder whose value is a newline‑separated list of
+    "description : weight" pairs, and clear the {{bl_weight}} placeholder.
     """
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
@@ -1408,7 +1407,33 @@ def _dossier_replace_paragraph(para, replacements):
     if not para.runs:
         return
 
-    # Use private Unicode markers for <w:br/> and <w:tab/> that already exist
+    # ---- Detect and pre‑process the special pattern ----
+    full_text = "".join(run.text for run in para.runs)
+    pattern = r'\{\{cargo\}\}\s*:\s*\{\{bl_weight\}\}'
+    if re.search(pattern, full_text):
+        # Build combined lines from cargo and bl_weight
+        cargo_str = replacements.get("cargo", "")
+        bl_str = replacements.get("bl_weight", "")
+        cargo_lines = cargo_str.split('\n') if cargo_str else []
+        bl_lines = bl_str.split('\n') if bl_str else []
+        max_len = max(len(cargo_lines), len(bl_lines))
+        combined_lines = []
+        for i in range(max_len):
+            desc = cargo_lines[i] if i < len(cargo_lines) else ""
+            weight = bl_lines[i] if i < len(bl_lines) else ""
+            if desc or weight:
+                combined_lines.append(f"{desc}{' : ' + weight if weight else ''}".strip())
+        combined = "\n".join(combined_lines)
+        # Override replacements: set cargo to combined, clear bl_weight
+        replacements = dict(replacements)
+        replacements["cargo"] = combined
+        replacements["bl_weight"] = ""
+        # Replace the pattern in the paragraph text with {{cargo}} (so only one placeholder remains)
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(pattern, '{{cargo}}', run.text)
+
+    # ---- Standard placeholder replacement (newline → line break) ----
     BR = "\uE000"
     TAB = "\uE001"
 
@@ -1417,7 +1442,6 @@ def _dossier_replace_paragraph(para, replacements):
     W_TAB = qn('w:tab')
     W_CR  = qn('w:cr')
 
-    # Collect existing runs and their special elements
     parts = []
     for run in para.runs:
         for child in run._element:
@@ -1429,7 +1453,6 @@ def _dossier_replace_paragraph(para, replacements):
                 parts.append(TAB)
     full = "".join(parts)
 
-    # Replace all placeholders
     new = full
     for tag, val in replacements.items():
         if val is None:
@@ -1439,7 +1462,6 @@ def _dossier_replace_paragraph(para, replacements):
     if new == full:
         return
 
-    # Clear existing content (text, breaks, tabs)
     for run in para.runs:
         for child in list(run._element):
             if child.tag in (W_T, W_BR, W_TAB, W_CR):
@@ -1465,7 +1487,6 @@ def _dossier_replace_paragraph(para, replacements):
             flush_text()
             first_r.append(OxmlElement('w:tab'))
         elif ch == '\n':
-            # Convert newline to line break
             flush_text()
             first_r.append(OxmlElement('w:br'))
         else:
@@ -1513,10 +1534,6 @@ def _dossier_prevent_table_break(doc):
     """
     Keep table rows from splitting across pages, WITHOUT clipping cell content.
 
-    The previous version forced hRule='atLeast' → 'exact' on every row, which
-    locks the row at its stored minimum height and clips everything beneath.
-    That destroyed the A G E N T / M A S T E R stamp areas.
-
     Correct behaviour:
       - Set cantSplit='1' so a row never breaks across pages.
       - Leave trHeight alone. 'atLeast' is the right rule: rows grow to fit
@@ -1551,14 +1568,13 @@ def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:
 
     # Build cargo and bl_weight strings from cargo_items if available
     if req.cargo_items:
-        cargo_str = "\n".join([item.description for item in req.cargo_items if item.description])
-        weight_str = "\n".join([item.weight for item in req.cargo_items if item.weight])
-        # Use the new strings; if empty, fall back to old fields
-        final_cargo = cargo_str or (req.cargo or "")
-        final_bl_weight = weight_str or (req.bl_weight or "")
+        cargo_lines = [item.description for item in req.cargo_items if item.description]
+        weight_lines = [item.weight for item in req.cargo_items if item.weight]
+        cargo_str = "\n".join(cargo_lines) if cargo_lines else (req.cargo or "")
+        weight_str = "\n".join(weight_lines) if weight_lines else (req.bl_weight or "")
     else:
-        final_cargo = req.cargo or ""
-        final_bl_weight = req.bl_weight or ""
+        cargo_str = req.cargo or ""
+        weight_str = req.bl_weight or ""
 
     return {
         "vessel_name":    req.vessel_name  or "",
@@ -1568,8 +1584,8 @@ def _dossier_build_replacements(req: DossierRequest) -> Dict[str, str]:
         "deadweight":     req.deadweight   or "",
         "gross_tonnage":  req.gross_tonnage or "",
         "owner":          req.owner        or "",
-        "cargo":          final_cargo,
-        "bl_weight":      final_bl_weight,
+        "cargo":          cargo_str,
+        "bl_weight":      weight_str,
         "shipper":        req.shipper      or "",
         "notify":         req.notify       or "",
         "from":           req.from_port    or "",

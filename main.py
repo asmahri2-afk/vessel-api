@@ -1300,6 +1300,26 @@ async def sof_generate(data: SOFData, request: Request):
                     exc_info=True,
                 )
 
+        # ── Border repair for ops-log J/K columns ──────────────────────────
+        # openpyxl can corrupt the J (col 10) / K (col 11) borders on rows
+        # whose internal style index differs from the majority (e.g. rows 34,
+        # 43 in the current template).  The right-medium border migrates from
+        # K onto J, making the vertical line "move inside" visually.
+        # Fix: enforce the correct border on every ops-log row (29-58).
+        _border_J = Border(left=Side(style='thin'))
+        _border_K = Border(right=Side(style='medium'))
+        for _r in range(29, 59):
+            ws.cell(row=_r, column=10).border = _border_J
+            ws.cell(row=_r, column=11).border = _border_K
+        # Remove any spurious J:K merges in the ops-log area
+        _spurious = [
+            str(rng) for rng in ws.merged_cells.ranges
+            if rng.min_col == 10 and rng.max_col == 11
+            and 29 <= rng.min_row <= 58
+        ]
+        for _m in _spurious:
+            ws.unmerge_cells(_m)
+
         buf = io.BytesIO()
         wb.save(buf)
         buf.seek(0)

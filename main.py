@@ -1306,6 +1306,16 @@ async def sof_generate(data: SOFData, request: Request):
         # 43 in the current template).  The right-medium border migrates from
         # K onto J, making the vertical line "move inside" visually.
         # Fix: enforce the correct border on every ops-log row (29-58).
+        # ── Border repair for ops-log J/K columns ──────────────────────────
+        # Remove spurious J:K merges FIRST (before setting borders)
+        _spurious = [
+            str(rng) for rng in ws.merged_cells.ranges
+            if rng.min_col == 10 and rng.max_col == 11
+            and 29 <= rng.min_row <= 58
+        ]
+        for _m in _spurious:
+            ws.unmerge_cells(_m)
+        # Now enforce correct borders
         for _r in range(29, 59):
             _cj = ws.cell(row=_r, column=10)
             _cj.border = Border(
@@ -1319,14 +1329,6 @@ async def sof_generate(data: SOFData, request: Request):
                 top=_ck.border.top,
                 bottom=_ck.border.bottom,
             )
-        # Remove any spurious J:K merges in the ops-log area
-        _spurious = [
-            str(rng) for rng in ws.merged_cells.ranges
-            if rng.min_col == 10 and rng.max_col == 11
-            and 29 <= rng.min_row <= 58
-        ]
-        for _m in _spurious:
-            ws.unmerge_cells(_m)
 
         buf = io.BytesIO()
         wb.save(buf)

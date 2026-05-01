@@ -1312,14 +1312,12 @@ async def sof_generate(data: SOFData, request: Request):
                 left=Side(style='thin'),
                 top=_cj.border.top,
                 bottom=_cj.border.bottom,
-                right=_cj.border.right,
             )
             _ck = ws.cell(row=_r, column=11)
             _ck.border = Border(
                 right=Side(style='medium'),
                 top=_ck.border.top,
                 bottom=_ck.border.bottom,
-                left=_ck.border.left,
             )
         # Remove any spurious J:K merges in the ops-log area
         _spurious = [

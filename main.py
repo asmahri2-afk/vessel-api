@@ -790,40 +790,81 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"IMO {imo} | Failed to parse djson AIS data: {e}")
 
-    # ========== MYSHIPTRACKING FALLBACK — 3 tiers ==========
-    mst_data       = None
-    mst_port_calls: List[Dict] = []   # port calls piggy-backed from Tier 3 HTML fetch
+    # ========== POSITION FALLBACK — competitive multi-source selection ==========
+    # Cheap JSON sources (MST vessel-by-MMSI API + HiFleet) are always tried.
+    # Slower sources (MST map-tile JSON, MST HTML scrape) escalate only when no
+    # cheap candidate is "good enough" (age ≤ 30 min AND lat+lon decimal places
+    # ≥ 4).  All successful candidates compete on (recency, precision) — the
+    # freshest high-precision fix wins regardless of which source produced it.
+    #
+    # Why this matters: previously the chain stopped at the first tier that
+    # returned any lat/lon, so a stale low-precision MST API hit would be used
+    # even when HiFleet had a fresh 6-decimal fix sitting right behind it.
+    mst_data: Optional[Dict[str, Any]] = None
+    mst_port_calls: List[Dict] = []
+    candidates: List[Dict[str, Any]] = []
+
+    def _good_enough(c: Dict[str, Any]) -> bool:
+        age  = get_mst_age_minutes(c.get("last_pos_utc"))
+        prec = count_decimals(c["lat"]) + count_decimals(c["lon"])
+        return age <= 30 and prec >= 4
 
     if mmsi is not None:
-        # Tier 1: direct vessel-by-MMSI API (fastest, has timestamp)
-        mst_data = get_myshiptracking_pos_vessel_api(mmsi)
+        # Cheap source — MST vessel-by-MMSI JSON
+        cand = get_myshiptracking_pos_vessel_api(mmsi)
+        if cand and cand.get("lat") is not None:
+            candidates.append(cand)
 
-        # Tier 2: bounding-box map-tile JSON (needs VF coords, often 403)
-        if not mst_data and vf_lat is not None and vf_lon is not None:
-            mst_data = get_myshiptracking_pos_map_json(mmsi, vf_lat, vf_lon, session)
+        # Cheap source — HiFleet public lookup (no auth)
+        cand = get_hifleet_position(mmsi)
+        if cand and cand.get("lat") is not None:
+            candidates.append(cand)
 
-        # Tier 3: curl_cffi full HTML scrape (slowest, most reliable).
-        # Also parses port calls from the SAME page — no extra HTTP request needed.
-        if not mst_data or mst_data.get("lat") is None:
+        need_escalate = not any(_good_enough(c) for c in candidates)
+
+        # Escalation — MST bounding-box map JSON (needs VF coords, often 403,
+        # carries no timestamp so it can only win when nothing else has one)
+        if need_escalate and vf_lat is not None and vf_lon is not None:
+            cand = get_myshiptracking_pos_map_json(mmsi, vf_lat, vf_lon, session)
+            if cand and cand.get("lat") is not None:
+                candidates.append(cand)
+                need_escalate = not any(_good_enough(c) for c in candidates)
+
+        # Escalation — MST full HTML scrape (slowest; ALSO yields port calls)
+        if need_escalate:
             html_result = get_myshiptracking_pos_html(mmsi)
             if html_result:
-                # Pull out port calls before using the dict as position data
                 mst_port_calls = html_result.pop("port_calls", [])
                 if html_result.get("lat") is not None:
-                    mst_data = html_result
+                    candidates.append(html_result)
 
-        # Tier 4: HiFleet (free, no auth) — last resort if all MST tiers failed.
-        # Treated as part of the MST-fallback bucket: same decision logic, same
-        # mst_data slot, same timestamp-pop flow below.  ais_source="hifleet"
-        # so logs/UI can tell the source apart.
-        if not mst_data or mst_data.get("lat") is None:
-            hf_data = get_hifleet_position(mmsi)
-            if hf_data and hf_data.get("lat") is not None:
-                mst_data = hf_data
-                logger.info(
-                    f"IMO {imo} | Tier 4 HiFleet picked up position "
-                    f"(MST tiers all failed)"
-                )
+    # Pick best candidate using the same recency+precision rule that runs later
+    # for VF-vs-fallback (10-minute age tolerance, then precision wins).
+    if candidates:
+        best = candidates[0]
+        for c in candidates[1:]:
+            best_age  = get_mst_age_minutes(best.get("last_pos_utc"))
+            c_age     = get_mst_age_minutes(c.get("last_pos_utc"))
+            best_prec = count_decimals(best["lat"]) + count_decimals(best["lon"])
+            c_prec    = count_decimals(c["lat"]) + count_decimals(c["lon"])
+            if abs(c_age - best_age) <= 10:
+                if c_prec > best_prec:
+                    best = c
+            elif c_age < best_age:
+                best = c
+        mst_data = best
+
+        # Trace log so we can see who competed and who won
+        sources_log = ", ".join(
+            f"{c.get('ais_source')}"
+            f"(age={get_mst_age_minutes(c.get('last_pos_utc'))}m,"
+            f"p={count_decimals(c['lat']) + count_decimals(c['lon'])})"
+            for c in candidates
+        )
+        logger.info(
+            f"IMO {imo} | Fallback candidates [{len(candidates)}]: {sources_log} "
+            f"→ winner={mst_data.get('ais_source')}"
+        )
 
     # Pull the MST timestamp out before the decision so both ages are comparable.
     # We do NOT merge it into last_pos_utc yet — only do that if we actually use MST.

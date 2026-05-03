@@ -792,17 +792,29 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 
     # ========== POSITION FALLBACK — competitive multi-source selection ==========
     # Cheap JSON sources (MST vessel-by-MMSI API + HiFleet) are always tried.
-    # Slower sources (MST map-tile JSON, MST HTML scrape) escalate only when no
-    # cheap candidate is "good enough" (age ≤ 30 min AND lat+lon decimal places
-    # ≥ 4).  All successful candidates compete on (recency, precision) — the
-    # freshest high-precision fix wins regardless of which source produced it.
+    # Slower sources (MST map-tile JSON, MST HTML scrape) escalate only when
+    # neither VF nor any cheap candidate is "good enough" (age ≤ 30 min AND
+    # lat+lon decimal places ≥ 4).  All successful candidates compete on
+    # (recency, precision) — the freshest high-precision fix wins regardless
+    # of which source produced it.
     #
     # Why this matters: previously the chain stopped at the first tier that
     # returned any lat/lon, so a stale low-precision MST API hit would be used
     # even when HiFleet had a fresh 6-decimal fix sitting right behind it.
+    #
+    # VF-aware gate: if VF itself already has a fresh precise fix, we know it
+    # will win the VF-vs-fallback round downstream — so paying 3-5s for the
+    # HTML scrape is wasted work.  We gate escalation on `vf_good` too.
     mst_data: Optional[Dict[str, Any]] = None
     mst_port_calls: List[Dict] = []
     candidates: List[Dict[str, Any]] = []
+
+    vf_good = (
+        vf_lat is not None
+        and vf_lon is not None
+        and get_vf_age_minutes(last_pos_utc) <= 30
+        and count_decimals(vf_lat) + count_decimals(vf_lon) >= 4
+    )
 
     def _good_enough(c: Dict[str, Any]) -> bool:
         age  = get_mst_age_minutes(c.get("last_pos_utc"))
@@ -820,7 +832,7 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         if cand and cand.get("lat") is not None:
             candidates.append(cand)
 
-        need_escalate = not any(_good_enough(c) for c in candidates)
+        need_escalate = not vf_good and not any(_good_enough(c) for c in candidates)
 
         # Escalation — MST bounding-box map JSON (needs VF coords, often 403,
         # carries no timestamp so it can only win when nothing else has one)

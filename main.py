@@ -8,7 +8,7 @@ import httpx
 import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -83,6 +83,7 @@ def _make_mst_headers() -> dict:
 HEADERS = _make_headers()
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
+HIFLEET_POS_URL    = "https://www.hifleet.com/hifleetapi/getRecentshipsVesselByMmsisAction.do"
 
 API_SECRET         = os.getenv("API_SECRET", "")
 EQUASIS_EMAIL      = os.getenv("EQUASIS_EMAIL", "")
@@ -582,6 +583,141 @@ def get_myshiptracking_pos_map_json(
     return None
 
 # ============================================================
+# HIFLEET HELPERS — free, no auth (Tier 4 fallback)
+# ============================================================
+#
+# HiFleet exposes a public AIS lookup that takes a list of MMSIs and returns
+# position + ETA + status.  No authentication, no API key.  Used as a last
+# resort when all three MST tiers fail (typically when Cloudflare aggressively
+# rate-limits Oracle Cloud egress IPs).
+#
+# Response timestamps are coarse — the API returns an "age" string like "1min",
+# "2h", "1d" rather than an actual UTC timestamp.  We convert that to an
+# estimated `last_pos_utc` formatted to match MST's "%Y-%m-%d %H:%M" so the
+# downstream age-comparison decision logic (parse_mst_timestamp) keeps working.
+# ============================================================
+
+def parse_hifleet_age(age_str: str) -> int:
+    """
+    Convert HiFleet age strings to minutes.
+    Examples: '1min' -> 1, '2h' -> 120, '1d' -> 1440
+    Returns 999 (effectively infinite) on parse failure.
+    """
+    if not age_str:
+        return 999
+    m = re.match(r'(\d+(?:\.\d+)?)\s*(min|h|d)', age_str.lower())
+    if not m:
+        return 999
+    val  = float(m.group(1))
+    unit = m.group(2)
+    if unit == "min":
+        return int(val)
+    if unit == "h":
+        return int(val * 60)
+    if unit == "d":
+        return int(val * 1440)
+    return 999
+
+
+def get_hifleet_position(mmsi: str) -> Optional[Dict[str, Any]]:
+    """
+    Tier 4 — HiFleet public position lookup (free, no auth).
+
+    Uses curl_cffi with Chrome 120 impersonation when available so the request
+    survives any Cloudflare-style fingerprint check on hifleet.com; falls back
+    to plain `requests` otherwise.
+
+    Returns a dict with: lat, lon, sog, cog, last_pos_utc, ais_source
+    or None on failure.
+    """
+    if not mmsi:
+        return None
+
+    params  = {"mmsis": mmsi, "i18n": "en", "_v": "5.4.335"}
+    headers = {
+        "User-Agent":       random.choice(_USER_AGENTS),
+        "Accept":           "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language":  "en-US,en;q=0.9",
+        "Accept-Encoding":  "gzip, deflate, br",
+        "Referer":          "https://www.hifleet.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    try:
+        if CURL_CFFI_AVAILABLE:
+            resp = curl_requests.get(
+                HIFLEET_POS_URL,
+                params=params,
+                headers=headers,
+                impersonate="chrome120",
+                timeout=10,
+            )
+        else:
+            resp = requests.get(
+                HIFLEET_POS_URL,
+                params=params,
+                headers=headers,
+                timeout=10,
+            )
+
+        if resp.status_code != 200:
+            logger.debug(f"HiFleet returned HTTP {resp.status_code} for MMSI {mmsi}")
+            return None
+
+        data = resp.json()
+        if data.get("status") != "1":
+            logger.debug(
+                f"HiFleet status != 1 for MMSI {mmsi}: {data.get('status')}"
+            )
+            return None
+
+        vessels = data.get("data", [])
+        if not vessels:
+            logger.debug(f"HiFleet: empty data array for MMSI {mmsi}")
+            return None
+
+        v = vessels[0]
+        lat = v.get("la")
+        lon = v.get("lo")
+        if lat is None or lon is None:
+            return None
+
+        # Age in minutes from updatetimeformat (e.g. "1min", "2h", "1d").
+        age_str = v.get("updatetimeformat") or v.get("updateTimeInfo")
+        age_minutes = parse_hifleet_age(age_str) if age_str else 999
+
+        # Estimate last_pos_utc from the age — formatted to match MST's
+        # "%Y-%m-%d %H:%M" so parse_mst_timestamp() picks it up downstream.
+        last_pos_utc: Optional[str] = None
+        if age_minutes != 999:
+            last_pos_utc = (
+                datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+            ).strftime("%Y-%m-%d %H:%M")
+
+        result = {
+            "lat":          float(lat),
+            "lon":          float(lon),
+            "sog":          float(v["sp"]) if v.get("sp") is not None else None,
+            "cog":          float(v["co"]) if v.get("co") is not None else None,
+            "last_pos_utc": last_pos_utc,
+            "ais_source":   "hifleet",
+        }
+        logger.info(
+            f"MMSI {mmsi} | HiFleet: "
+            f"lat={result['lat']}, lon={result['lon']}, "
+            f"sog={result['sog']}, cog={result['cog']}, "
+            f"age={age_minutes}min"
+        )
+        return result
+
+    except Exception as e:
+        logger.debug(
+            f"HiFleet position error for MMSI {mmsi}: {type(e).__name__}: {e}"
+        )
+        return None
+
+
+# ============================================================
 # MAIN SCRAPER (VF primary + MST 3-tier fallback)
 # ============================================================
 
@@ -675,6 +811,19 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
                 mst_port_calls = html_result.pop("port_calls", [])
                 if html_result.get("lat") is not None:
                     mst_data = html_result
+
+        # Tier 4: HiFleet (free, no auth) — last resort if all MST tiers failed.
+        # Treated as part of the MST-fallback bucket: same decision logic, same
+        # mst_data slot, same timestamp-pop flow below.  ais_source="hifleet"
+        # so logs/UI can tell the source apart.
+        if not mst_data or mst_data.get("lat") is None:
+            hf_data = get_hifleet_position(mmsi)
+            if hf_data and hf_data.get("lat") is not None:
+                mst_data = hf_data
+                logger.info(
+                    f"IMO {imo} | Tier 4 HiFleet picked up position "
+                    f"(MST tiers all failed)"
+                )
 
     # Pull the MST timestamp out before the decision so both ages are comparable.
     # We do NOT merge it into last_pos_utc yet — only do that if we actually use MST.

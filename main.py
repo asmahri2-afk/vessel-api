@@ -1343,6 +1343,8 @@ class SOFData(BaseModel):
     anchor_weigh_time: Optional[str] = ''
     pilot_date:        Optional[str] = ''
     pilot_time:        Optional[str] = ''
+    tug_in:            Optional[str] = ''
+    tug_out:           Optional[str] = ''
     rows:              List[SOFRow] = []
 
 def fmt_dt(date: str, time: str) -> str:
@@ -1417,6 +1419,8 @@ async def sof_generate(data: SOFData, request: Request):
             '{{ANCHOR_DROP_DATE}} at {{ANCHOR_DROP_TIME}} hr':  fmt_dt(data.anchor_drop_date,  data.anchor_drop_time),
             '{{ANCHOR_WEIGH_DATE}} at {{ANCHOR_WEIGH_TIME}} hr': fmt_dt(data.anchor_weigh_date, data.anchor_weigh_time),
             '{{PILOT_DATE}} at {{PILOT_TIME}} hr':               fmt_dt(data.pilot_date,        data.pilot_time),
+            '{{TUG_IN}}':         data.tug_in or '',
+            '{{TUG_OUT}}':        data.tug_out or '',
             'M/V {{VESSEL_NAME}}': f"M/V {data.vessel or ''}",
         }
 
@@ -1502,14 +1506,11 @@ async def sof_generate(data: SOFData, request: Request):
                     exc_info=True,
                 )
 
-        # ── Border repair for ops-log J/K columns ──────────────────────────
-        # openpyxl can corrupt the J (col 10) / K (col 11) borders on rows
-        # whose internal style index differs from the majority (e.g. rows 34,
-        # 43 in the current template).  The right-medium border migrates from
-        # K onto J, making the vertical line "move inside" visually.
-        # Fix: enforce the correct border on every ops-log row (29-58).
-        # ── Border repair for ops-log J/K columns ──────────────────────────
-        # Remove spurious J:K merges FIRST (before setting borders)
+        # ── Border repair for ops-log section (rows 29-58) ─────────────────
+        # The {{ROW_DATE}} marker row in the template has incomplete borders,
+        # so filled rows inherit broken borders. This pass enforces the correct
+        # table borders column-by-column to match the rest of the ops-log area.
+        # Also fixes the J/K corruption from openpyxl style index quirks.
         _spurious = [
             str(rng) for rng in ws.merged_cells.ranges
             if rng.min_col == 10 and rng.max_col == 11
@@ -1517,20 +1518,27 @@ async def sof_generate(data: SOFData, request: Request):
         ]
         for _m in _spurious:
             ws.unmerge_cells(_m)
-        # Now enforce correct borders
+
+        _thin = Side(style='thin')
+        _medium = Side(style='medium')
         for _r in range(29, 59):
+            # Col A: outer left of table (medium), inner right (thin)
+            _cA = ws.cell(row=_r, column=1)
+            _cA.border = Border(left=_medium, right=_thin,
+                                top=_cA.border.top, bottom=_cA.border.bottom)
+            # Cols C-G: data columns (Hours worked / stopped / cranes / quantity)
+            for _c in range(3, 8):
+                _cell = ws.cell(row=_r, column=_c)
+                _cell.border = Border(left=_thin, right=_thin,
+                                      top=_cell.border.top, bottom=_cell.border.bottom)
+            # Col J: left edge of Remarks column (thin)
             _cj = ws.cell(row=_r, column=10)
-            _cj.border = Border(
-                left=Side(style='thin'),
-                top=_cj.border.top,
-                bottom=_cj.border.bottom,
-            )
+            _cj.border = Border(left=_thin,
+                                top=_cj.border.top, bottom=_cj.border.bottom)
+            # Col K: outer right of table (medium)
             _ck = ws.cell(row=_r, column=11)
-            _ck.border = Border(
-                right=Side(style='medium'),
-                top=_ck.border.top,
-                bottom=_ck.border.bottom,
-            )
+            _ck.border = Border(right=_medium,
+                                top=_ck.border.top, bottom=_ck.border.bottom)
 
         buf = io.BytesIO()
         wb.save(buf)

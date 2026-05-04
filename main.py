@@ -1371,7 +1371,7 @@ async def get_sof_template() -> bytes:
     global SOF_TEMPLATE_BYTES
     if SOF_TEMPLATE_BYTES:
         return SOF_TEMPLATE_BYTES
-    url = 'https://asmahri2-afk.github.io/test/SOF_TEMPLATE.xlsx'
+    url = 'https://vesseltracker.pages.dev/SOF_TEMPLATE.xlsx'
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(url)
         r.raise_for_status()
@@ -1487,7 +1487,7 @@ async def sof_generate(data: SOFData, request: Request):
         # ── COMANAV logo injection ─────────────────────────────────────────────
         if (data.agent or '').upper() == 'COMANAV' and ws._images:
             try:
-                comanav_url = 'https://asmahri2-afk.github.io/test/logo-comanav.png'
+                comanav_url = 'https://vesseltracker.pages.dev/logo-comanav.png'
                 async with httpx.AsyncClient(timeout=10) as client:
                     logo_resp = await client.get(comanav_url)
                     logo_resp.raise_for_status()

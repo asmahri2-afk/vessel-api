@@ -1311,6 +1311,8 @@ class SOFRow(BaseModel):
 
 class SOFData(BaseModel):
     agent:             Optional[str] = ''
+    company_name:      Optional[str] = ''   # injected server-side by the Worker (user profile)
+    company_logo_url:  Optional[str] = ''   # injected server-side by the Worker (user profile)
     vessel:            Optional[str] = ''
     port:              Optional[str] = ''
     owners:            Optional[str] = ''
@@ -1396,7 +1398,7 @@ async def sof_generate(data: SOFData, request: Request):
         operation_verb = 'loading' if (data.operation_type or '').lower() == 'export' else 'discharging'
 
         tag_values = {
-            '{{AGENT}}':          data.agent or '',
+            '{{AGENT}}':          data.company_name or data.agent or '',
             '{{VESSEL_NAME}}':    data.vessel or '',
             '{{PORT}}':           data.port or '',
             '{{OWNERS}}':         data.owners or '',
@@ -1488,18 +1490,33 @@ async def sof_generate(data: SOFData, request: Request):
                     if s.get('fill'):      cell.fill      = s['fill']
                     if s.get('alignment'): cell.alignment = s['alignment']
 
-        # ── COMANAV logo injection ─────────────────────────────────────────────
-        if (data.agent or '').upper() == 'COMANAV' and ws._images:
+        # ── Company logo injection ─────────────────────────────────────────────
+        # Priority: the user's own logo (uploaded via the app, URL injected
+        # server-side by the Worker) → legacy COMANAV preset → template default.
+        # URL whitelist prevents SSRF: only our Supabase Storage bucket and the
+        # app's own Pages origin are ever fetched.
+        _ALLOWED_LOGO_PREFIXES = (
+            'https://rpzcphszvdgjsqnhwdhm.supabase.co/storage/v1/object/public/logos/',
+            'https://vesseltracker.pages.dev/',
+        )
+        logo_url = None
+        if data.company_logo_url and data.company_logo_url.startswith(_ALLOWED_LOGO_PREFIXES):
+            logo_url = data.company_logo_url
+        elif (data.agent or '').upper() == 'COMANAV':
+            logo_url = 'https://vesseltracker.pages.dev/logo-comanav.png'
+
+        if logo_url and ws._images:
             try:
-                comanav_url = 'https://vesseltracker.pages.dev/logo-comanav.png'
                 async with httpx.AsyncClient(timeout=10) as client:
-                    logo_resp = await client.get(comanav_url)
+                    logo_resp = await client.get(logo_url)
                     logo_resp.raise_for_status()
                     logo_bytes = logo_resp.content
+                if len(logo_bytes) > 1_000_000:
+                    raise ValueError(f"Logo too large: {len(logo_bytes)} bytes")
 
                 old_img = ws._images[0]
                 old_img.ref = io.BytesIO(logo_bytes)
-                logger.info(f"Swapped logo to COMANAV ({len(logo_bytes)} bytes)")
+                logger.info(f"Swapped SOF logo ({len(logo_bytes)} bytes) from {logo_url.split('?')[0]}")
             except Exception as e:
                 logger.warning(
                     f"Logo swap failed (non-critical): {type(e).__name__}: {e}",

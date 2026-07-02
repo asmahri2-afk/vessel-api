@@ -84,6 +84,7 @@ HEADERS = _make_headers()
 
 MYSHIPTRACKING_URL = "https://www.myshiptracking.com/requests/vesselsonmaptempTTT.php"
 HIFLEET_POS_URL    = "https://www.hifleet.com/hifleetapi/getRecentshipsVesselByMmsisAction.do"
+HIFLEET_DEST_URL   = "https://www.hifleet.com/hifleetapi/getDestinationByMmsi.do"
 
 API_SECRET         = os.getenv("API_SECRET", "")
 EQUASIS_EMAIL      = os.getenv("EQUASIS_EMAIL", "")
@@ -717,6 +718,91 @@ def get_hifleet_position(mmsi: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_hifleet_destination(mmsi: str) -> Optional[str]:
+    """
+    HiFleet destination lookup — POSTs the MMSI to the public
+    getDestinationByMmsi endpoint and returns the raw AIS destination string
+    typed in by the vessel's crew (manual input).
+
+    Sample response:
+        {"status":"1","msg":"","data":{
+            "cnportname":"无法转译","destination":"TAN TAN TTA",
+            "portname":"NOT AVAILABLE","desTranslate":"0"
+         }}
+
+    We deliberately prefer the raw `destination` field over the translated
+    `portname` — when desTranslate="0" the translation is unavailable, and
+    even when it is, the crew-typed text often carries useful info (e.g.
+    "TAN TAN TTA" with the UN/LOCODE suffix) that the port lookup strips out.
+
+    Returns the destination string, or None on failure / empty / untranslatable.
+    """
+    if not mmsi:
+        return None
+
+    # Endpoint is a POST with form-encoded body — matching the live app's
+    # request shape (i18n=en, _v matches the current public build).
+    headers = {
+        "User-Agent":       random.choice(_USER_AGENTS),
+        "Accept":           "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language":  "en-US,en;q=0.9",
+        "Accept-Encoding":  "gzip, deflate, br",
+        "Content-Type":     "application/x-www-form-urlencoded; charset=UTF-8",
+        "Referer":          "https://www.hifleet.com/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    data = {"mmsi": str(mmsi), "i18n": "en", "_v": "5.4.388"}
+
+    try:
+        if CURL_CFFI_AVAILABLE:
+            resp = curl_requests.post(
+                HIFLEET_DEST_URL,
+                data=data,
+                headers=headers,
+                impersonate="chrome120",
+                timeout=10,
+            )
+        else:
+            resp = requests.post(
+                HIFLEET_DEST_URL,
+                data=data,
+                headers=headers,
+                timeout=10,
+            )
+
+        if resp.status_code != 200:
+            logger.debug(
+                f"HiFleet dest HTTP {resp.status_code} for MMSI {mmsi}"
+            )
+            return None
+
+        payload = resp.json()
+        if payload.get("status") != "1":
+            logger.debug(
+                f"HiFleet dest status != 1 for MMSI {mmsi}: {payload.get('status')}"
+            )
+            return None
+
+        d = payload.get("data") or {}
+        dest = (d.get("destination") or "").strip()
+
+        # Same sentinel set used by the VF fallbacks — drop placeholders.
+        if dest.upper() in ("-", "N/A", "NA", "UNKNOWN", "NOT AVAILABLE"):
+            return None
+
+        if dest:
+            logger.info(f"MMSI {mmsi} | HiFleet destination='{dest}'")
+            return dest
+
+        return None
+
+    except Exception as e:
+        logger.debug(
+            f"HiFleet dest error for MMSI {mmsi}: {type(e).__name__}: {e}"
+        )
+        return None
+
+
 # ============================================================
 # MAIN SCRAPER (VF primary + MST 3-tier fallback)
 # ============================================================
@@ -777,6 +863,19 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
         )
         if m:
             destination = m.group(1).strip()
+    # Destination fallback 5: HiFleet public destination lookup
+    # VF only echoes the destination when the crew typed one into their AIS
+    # transponder AND VF happened to ingest it. HiFleet exposes the same raw
+    # AIS manual-input field through a free, no-auth POST — so when VF is
+    # empty, this is the best signal we have (and matches what the live
+    # hifleet.com web app shows for the same MMSI). We deliberately use the
+    # raw `destination` field, NOT the translated `portname`, because the
+    # translation is often "NOT AVAILABLE" / "无法转译" while the raw text is
+    # still meaningful (e.g. "TAN TAN TTA").
+    if not destination and mmsi:
+        hi_dest = get_hifleet_destination(mmsi)
+        if hi_dest:
+            destination = hi_dest
     logger.info(f"IMO {imo} | destination='{destination or 'N/A'}'")
 
     draught_val = static_data.get("Current draught") or static_data.get("Draught")

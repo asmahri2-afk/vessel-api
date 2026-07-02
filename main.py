@@ -735,8 +735,20 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
 
     name_el = soup.select_one("h1.title")
     name = name_el.get_text(strip=True) if name_el else f"IMO {imo}"
+    # Destination — VF's obfuscated bundler classes (_npNa) change on every
+    # site rebuild, so never rely on a single selector. Fallback chain:
+    #   1) legacy selector  2) any anchor in the destination block
+    #   3) "Destination" row in the AIS table  4) og:description regex
+    destination = ""
     dest_el = soup.select_one("div.vi__r1.vi__sbt a._npNa")
-    destination = dest_el.get_text(strip=True) if dest_el else ""
+    if dest_el:
+        destination = dest_el.get_text(strip=True)
+    if not destination:
+        dest_el = soup.select_one("div.vi__r1.vi__sbt a") or soup.select_one("div.vi__sbt a")
+        if dest_el:
+            destination = dest_el.get_text(strip=True)
+    if destination.upper() in ("-", "N/A", "NA", "UNKNOWN"):
+        destination = ""
 
     info_icon = soup.select_one("svg.ttt1.info")
     last_pos_utc = info_icon["data-title"] if info_icon and info_icon.has_attr("data-title") else None
@@ -748,6 +760,24 @@ def scrape_vf_full(imo: str, session: requests.Session) -> Dict[str, Any]:
     aparams_data   = extract_table_data(soup, "aparams")
     static_data    = {**tech_data, **dims_data, **ais_table_data, **aparams_data}
     mmsi           = extract_mmsi(soup, static_data)
+
+    # Destination fallback 3: AIS data table row
+    if not destination:
+        destination = (static_data.get("Destination") or "").strip()
+        if destination.upper() in ("-", "N/A", "NA", "UNKNOWN"):
+            destination = ""
+    # Destination fallback 4: og:description ("... en route to XXX, expected ...")
+    if not destination:
+        og = soup.find("meta", attrs={"property": "og:description"})
+        og_txt = og.get("content", "") if og else ""
+        m = re.search(
+            r"(?:en route to|sailing to|underway to|to the port of)\s+"
+            r"([A-Za-z0-9 .,'()/-]{2,40}?)(?:,|\.|\s+expected|\s+ETA|$)",
+            og_txt, re.IGNORECASE,
+        )
+        if m:
+            destination = m.group(1).strip()
+    logger.info(f"IMO {imo} | destination='{destination or 'N/A'}'")
 
     draught_val = static_data.get("Current draught") or static_data.get("Draught")
     if not draught_val:
